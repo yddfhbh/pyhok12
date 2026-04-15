@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -140,6 +139,40 @@ body {
 }
 
 .message-row:hover { background: #2e3035; }
+
+/* ===== 연속 메시지 (프로필 생략) ===== */
+.message-row.continuation {
+    margin-top: 0;
+    padding-top: 2px;
+    padding-bottom: 2px;
+    min-height: unset;
+}
+
+.message-row.continuation .avatar-placeholder {
+    width: 40px;
+    flex-shrink: 0;
+}
+
+.message-row.continuation .message-header {
+    display: none;
+}
+
+.message-row.continuation:hover .cont-timestamp {
+    display: block;
+}
+
+.cont-timestamp {
+    display: none;
+    position: absolute;
+    left: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: #949ba4;
+    width: 44px;
+    text-align: center;
+    pointer-events: none;
+}
 
 .avatar {
     width: 40px; height: 40px; border-radius: 50%;
@@ -416,7 +449,7 @@ body {
 
     <div id="banner-section">
         <img id="hero-image"
-             src="https://media.discordapp.net/attachments/1467897876943339721/1468021938159878481/20260202_195609.jpg?ex=69e0c4b8&is=69df7338&hm=d73ddf39fc73471f835a028954958b117093c99c5eac85c9c6f4c3e6109abd31&=&format=webp&width=1216&height=685"
+             src="https://media.discordapp.net/attachments/1467897876943339721/1468021938159878481/20250202_195609.jpg?ex=69e0c4b8&is=69df7338&hm=d73ddf39fc73471f835a028954958b117093c99c5eac85c9c6f4c3e6109abd31&=&format=webp&width=1216&height=685"
              alt="배너"
              onerror="this.style.display='none'">
     </div>
@@ -552,28 +585,36 @@ body {
 
     /* ===== DOM ===== */
     var $ = function(id) { return document.getElementById(id); };
-    var chatBox       = $("chat-box");
-    var noticeView    = $("notice-view");
-    var inputWrap     = $("input-wrap");
-    var noticeLocked  = $("notice-locked");
-    var nameInput     = $("name-input");
-    var msgInput      = $("msg-input");
-    var imageFileInput= $("imageFile");
-    var fileNameEl    = $("file-name");
-    var sendBtn       = $("sendBtn");
-    var previewWrap   = $("preview-wrap");
-    var previewImg    = $("preview");
-    var removeImageBtn= $("remove-image");
-    var imageModal    = $("image-modal");
-    var modalImage    = $("modal-image");
-    var topbarName    = $("topbar-name");
-    var topbarTopic   = $("topbar-topic");
-    var chGeneral     = $("ch-general");
-    var chNotice      = $("ch-notice");
-    var statusBar     = $("status-bar");
+    var chatBox        = $("chat-box");
+    var noticeView     = $("notice-view");
+    var inputWrap      = $("input-wrap");
+    var noticeLocked   = $("notice-locked");
+    var nameInput      = $("name-input");
+    var msgInput       = $("msg-input");
+    var imageFileInput = $("imageFile");
+    var fileNameEl     = $("file-name");
+    var sendBtn        = $("sendBtn");
+    var previewWrap    = $("preview-wrap");
+    var previewImg     = $("preview");
+    var removeImageBtn = $("remove-image");
+    var imageModal     = $("image-modal");
+    var modalImage     = $("modal-image");
+    var topbarName     = $("topbar-name");
+    var topbarTopic    = $("topbar-topic");
+    var chGeneral      = $("ch-general");
+    var chNotice       = $("ch-notice");
+    var statusBar      = $("status-bar");
 
     var selectedBase64 = "";
     var isSending = false;
+    var lastMessageName = "";
+
+    /* ===== 유틸 ===== */
+    function escapeHtml(str) {
+        var div = document.createElement("div");
+        div.appendChild(document.createTextNode(str));
+        return div.innerHTML;
+    }
 
     /* ===== 연결 상태 ===== */
     db.ref(".info/connected").on("value", function(snap) {
@@ -677,6 +718,78 @@ body {
         fileNameEl.textContent = "";
     }
 
+    /* ===== 메시지 렌더링 ===== */
+    function renderMessage(data, key) {
+        var name  = data.name || "익명";
+        var text  = data.text || "";
+        var image = data.image || "";
+        var time  = data.time || 0;
+
+        var date = new Date(time);
+        var h = date.getHours();
+        var m = String(date.getMinutes()).padStart(2, "0");
+        var ampm = h < 12 ? "오전" : "오후";
+        var h12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+        var fullTime  = ampm + " " + h12 + ":" + m;
+        var shortTime = h12 + ":" + m;
+
+        var isContinuation = (lastMessageName === name);
+        lastMessageName = name;
+
+        var color   = getColor(name);
+        var initial = name.charAt(0).toUpperCase();
+
+        var row = document.createElement("div");
+        row.className = "message-row" + (isContinuation ? " continuation" : "");
+        row.setAttribute("data-key", key);
+        row.setAttribute("data-name", name);
+
+        var html = "";
+
+        if (isContinuation) {
+            html += '<span class="cont-timestamp">' + escapeHtml(shortTime) + '</span>';
+            html += '<div class="avatar-placeholder"></div>';
+            html += '<div class="message-content">';
+        } else {
+            html += '<div class="avatar ' + color + '">' + escapeHtml(initial) + '</div>';
+            html += '<div class="message-content">';
+            html += '<div class="message-header">';
+            html += '<span class="name">' + escapeHtml(name) + '</span>';
+            html += '<span class="timestamp">' + escapeHtml(fullTime) + '</span>';
+            html += '</div>';
+        }
+
+        if (text) {
+            html += '<div class="message-text">' + escapeHtml(text) + '</div>';
+        }
+
+        if (image) {
+            html += '<img class="chat-image" src="' + image + '" alt="사진" loading="lazy"'
+                 + ' onerror="this.outerHTML=\'<span class=img-error>이미지를 불러올 수 없습니다</span>\'">';
+        }
+
+        html += '</div>';
+
+        row.innerHTML = html;
+
+        /* 이미지 클릭 → 모달 */
+        var chatImg = row.querySelector(".chat-image");
+        if (chatImg) {
+            chatImg.addEventListener("click", function() {
+                modalImage.src = this.src;
+                imageModal.style.display = "flex";
+            });
+        }
+
+        chatBox.appendChild(row);
+    }
+
+    /* ===== 이미지 모달 닫기 ===== */
+    imageModal.addEventListener("click", function() {
+        imageModal.style.display = "none";
+        modalImage.src = "";
+    });
+
     /* ===== 전송 ===== */
     function send() {
         if (isSending) return;
@@ -684,131 +797,56 @@ body {
         var text = msgInput.value.trim();
 
         if (!name || name.length > 12) { alert("닉네임 1~12자"); return; }
-        if (!text && !selectedBase64) { alert("메시지 또는 사진 필요"); return; }
-        if (text.length > 200) { alert("200자 이하"); return; }
+        if (!text && !selectedBase64)   { alert("메시지 또는 사진 필요"); return; }
+        if (text.length > 200)          { alert("200자 이하"); return; }
 
         isSending = true;
         sendBtn.disabled = true;
 
-        var data = { name: name, message: text, time: Date.now() };
-        if (selectedBase64) data.imageData = selectedBase64;
+        var msgData = {
+            name: name,
+            text: text,
+            time: firebase.database.ServerValue.TIMESTAMP
+        };
 
-        db.ref("chat").push(data, function(error) {
-            if (error) {
-                alert("전송 실패: " + error.message);
-            } else {
-                msgInput.value = "";
-                clearImage();
-            }
+        if (selectedBase64) {
+            msgData.image = selectedBase64;
+        }
+
+        db.ref("messages").push(msgData).then(function() {
+            msgInput.value = "";
+            clearImage();
+            isSending = false;
+            sendBtn.disabled = false;
+            msgInput.focus();
+        }).catch(function(err) {
+            alert("전송 실패: " + err.message);
             isSending = false;
             sendBtn.disabled = false;
         });
     }
 
-    msgInput.addEventListener("keypress", function(e) {
-        if (e.key === "Enter") { e.preventDefault(); send(); }
-    });
+    /* ===== 전송 이벤트 ===== */
     sendBtn.addEventListener("click", send);
 
-    /* ===== 타임스탬프 ===== */
-    function formatTime(ts) {
-        var d = new Date(ts);
-        var now = new Date();
-        var isToday = d.toDateString() === now.toDateString();
-        var y = new Date(now); y.setDate(y.getDate() - 1);
-        var isYesterday = d.toDateString() === y.toDateString();
-        var t = d.toLocaleTimeString("ko-KR", { hour:"2-digit", minute:"2-digit", hour12:true, timeZone:"Asia/Seoul" });
-        if (isToday) return "오늘 " + t;
-        if (isYesterday) return "어제 " + t;
-        return d.toLocaleDateString("ko-KR", { timeZone:"Asia/Seoul" }) + " " + t;
-    }
-
-    /* ===== 메시지 렌더링 ===== */
-    function renderMessage(msg) {
-        var row = document.createElement("div");
-        row.className = "message-row";
-
-        var av = document.createElement("div");
-        av.className = "avatar " + getColor(msg.name || "익명");
-        av.textContent = (msg.name || "?").charAt(0);
-
-        var cont = document.createElement("div");
-        cont.className = "message-content";
-
-        var hdr = document.createElement("div");
-        hdr.className = "message-header";
-
-        var nm = document.createElement("span");
-        nm.className = "name";
-        nm.textContent = msg.name || "익명";
-
-        var tm = document.createElement("span");
-        tm.className = "timestamp";
-        tm.textContent = formatTime(msg.time);
-
-        hdr.appendChild(nm);
-        hdr.appendChild(tm);
-        cont.appendChild(hdr);
-
-        if (msg.message && String(msg.message).trim()) {
-            var txt = document.createElement("div");
-            txt.className = "message-text";
-            txt.textContent = msg.message;
-            cont.appendChild(txt);
-        }
-
-        // base64 이미지
-        if (msg.imageData && String(msg.imageData).indexOf("data:image") === 0) {
-            var img1 = document.createElement("img");
-            img1.className = "chat-image";
-            img1.src = msg.imageData;
-            img1.onclick = function() { modalImage.src = msg.imageData; imageModal.style.display = "flex"; };
-            cont.appendChild(img1);
-        }
-
-        // URL 이미지 (이전 데이터)
-        if (msg.imageUrl && String(msg.imageUrl).indexOf("http") === 0) {
-            var img2 = document.createElement("img");
-            img2.className = "chat-image";
-            img2.src = msg.imageUrl;
-            img2.onclick = function() { modalImage.src = msg.imageUrl; imageModal.style.display = "flex"; };
-            img2.onerror = function() {
-                var err = document.createElement("span");
-                err.className = "img-error";
-                err.textContent = "📷 이미지를 불러올 수 없습니다";
-                img2.parentNode.replaceChild(err, img2);
-            };
-            cont.appendChild(img2);
-        }
-
-        row.appendChild(av);
-        row.appendChild(cont);
-        chatBox.appendChild(row);
-        chatBox.scrollTop = chatBox.scrollHeight;
-    }
-
-    /* ===== 메시지 수신 ===== */
-    db.ref("chat").limitToLast(100).on("child_added", function(snapshot) {
-        try {
-            var msg = snapshot.val();
-            if (!msg || typeof msg.time !== "number") return;
-
-            // 7일 지난 메시지 삭제
-            if (Date.now() - msg.time > 604800000) {
-                db.ref("chat/" + snapshot.key).remove();
-                return;
-            }
-
-            renderMessage(msg);
-        } catch (e) {
-            console.warn("렌더링 오류:", e);
+    msgInput.addEventListener("keydown", function(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            send();
         }
     });
 
-    /* ===== 이미지 모달 ===== */
-    imageModal.addEventListener("click", function() {
-        imageModal.style.display = "none";
-        modalImage.src = "";
+    nameInput.addEventListener("keydown", function(e) {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            msgInput.focus();
+        }
+    });
+
+    /* ===== 메시지 수신 ===== */
+    db.ref("messages").orderByChild("time").on("child_added", function(snap) {
+        renderMessage(snap.val(), snap.key);
+        chatBox.scrollTop = chatBox.scrollHeight;
     });
 
 })();
