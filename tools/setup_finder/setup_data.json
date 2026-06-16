@@ -1,0 +1,456 @@
+{
+  "version": 1,
+  "source": "Setup Konbini.xlsx",
+  "seventh": [
+    {
+      "id": "TLJ",
+      "sol": 1.0,
+      "fumen": "v115@HhglCeg0Eeglywg0Eehlwwh0EeJeAgH",
+      "imgur": "Xjda82b"
+    },
+    {
+      "id": "TJS",
+      "sol": 1.0,
+      "fumen": "v115@HhwwCeg0EexwR4g0EewwR4h0EeJeAgH",
+      "imgur": "ywRpvfP"
+    },
+    {
+      "id": "TIJ",
+      "sol": 1.0,
+      "fumen": "v115@Hhg0CewwEei0xwEezhwwOeAgH",
+      "imgur": "yfbRKWx"
+    },
+    {
+      "id": "TIL",
+      "sol": 1.0,
+      "fumen": "v115@MhwwCeglEexwilEewwzhJeAgH",
+      "imgur": "TdGKjC2"
+    },
+    {
+      "id": "TJZ",
+      "sol": 1.0,
+      "fumen": "v115@HhwwGeAtg0xwEeBtg0wwFeAth0JeAgH",
+      "imgur": "LJ4DzMq"
+    },
+    {
+      "id": "TSO",
+      "sol": 1.0,
+      "fumen": "v115@RhRpAeR4wwDeRpR4ywCeJeAgH",
+      "imgur": "ZrGMTNQ"
+    },
+    {
+      "id": "TIS",
+      "sol": 1.0,
+      "fumen": "v115@ShR4wwFeR4ywzhAeJeAgH",
+      "imgur": "0Q44Kk6"
+    },
+    {
+      "id": "TIO",
+      "sol": 1.0,
+      "fumen": "v115@WhwwAeRpAezhywRpAeJeAgH",
+      "imgur": "v6ma6T9"
+    },
+    {
+      "id": "TSZ",
+      "sol": 1.0,
+      "fumen": "v115@DhBtIeBtGeR4wwFeR4ywJeAgH",
+      "imgur": "79Bo2yc"
+    },
+    {
+      "id": "IJO",
+      "sol": 1.0,
+      "fumen": "v115@Jhg0GeRpi0EeRpzhDeJeAgH",
+      "imgur": "WYLCXyp"
+    },
+    {
+      "id": "LJO",
+      "sol": 1.0,
+      "fumen": "v115@HhRpHeRpglg0Feili0DeJeAgH",
+      "imgur": "4fr2fvu"
+    },
+    {
+      "id": "ILJ",
+      "sol": 1.0,
+      "fumen": "v115@Hhglg0Hegli0FehlzhDeJeAgH",
+      "imgur": "Wd6zyns"
+    },
+    {
+      "id": "LJS",
+      "sol": 1.0,
+      "fumen": "v115@HhglQ4HeglR4g0FehlQ4i0DeJeAgH",
+      "imgur": "uQDb0GI"
+    },
+    {
+      "id": "IJS",
+      "sol": 1.0,
+      "fumen": "v115@NhR4GeR4i0Eezhg0JeAgH",
+      "imgur": "KAgjXya"
+    },
+    {
+      "id": "IJZ",
+      "sol": 1.0,
+      "fumen": "v115@NhAtg0GeBti0EeAtzhJeAgH",
+      "imgur": "79EIKuG"
+    },
+    {
+      "id": "LZO",
+      "sol": 1.0,
+      "fumen": "v115@NhBtGeRpBtglEeRpilJeAgH",
+      "imgur": "eMPigI5"
+    },
+    {
+      "id": "JZO",
+      "sol": 1.0,
+      "fumen": "v115@NhAtg0GeBtg0RpEeAth0RpJeAgH",
+      "imgur": "0bJXQsh"
+    },
+    {
+      "id": "ISO",
+      "sol": 1.0,
+      "fumen": "v115@EhwhGeQ4AewhGeR4whRpFeQ4whRpJeAgH",
+      "imgur": "tl2f8YP"
+    },
+    {
+      "id": "TLZ",
+      "sol": 1.0,
+      "fumen": "v115@MhglCewwEeglBtxwEehlBtwwJeAgH",
+      "imgur": "MxlcfPL"
+    },
+    {
+      "id": "TJO",
+      "sol": 1.0,
+      "fumen": "v115@Hhh0Gewwg0RpEexwg0RpFewwJeAgH",
+      "imgur": "46ScNuU"
+    },
+    {
+      "id": "TLO",
+      "sol": 1.0,
+      "fumen": "v115@HhwwGehlxwEeRpglwwFeRpglJeAgH",
+      "imgur": "wHY2Xst"
+    },
+    {
+      "id": "TLS",
+      "sol": 1.0,
+      "fumen": "v115@HhglQ4GewwglR4EexwhlQ4FewwJeAgH",
+      "imgur": "HZHAJ1P"
+    },
+    {
+      "id": "TZO",
+      "sol": 1.0,
+      "fumen": "v115@VhwwBtAeRpCeywBtRpJeAgH",
+      "imgur": "rkwVPbn"
+    },
+    {
+      "id": "TIZ",
+      "sol": 1.0,
+      "fumen": "v115@XhwwBtBezhywBtJeAgH",
+      "imgur": "yoBWW7e"
+    },
+    {
+      "id": "TSZ",
+      "sol": 1.0,
+      "fumen": "v115@/gR4GeR4HewwBtFeywBtEeJeAgH",
+      "imgur": "ha5XDLA"
+    },
+    {
+      "id": "ILO",
+      "sol": 1.0,
+      "fumen": "v115@OhglGeilRpDezhRpJeAgH",
+      "imgur": "giOHsOk"
+    },
+    {
+      "id": "ILJ",
+      "sol": 1.0,
+      "fumen": "v115@Phglg0Feilg0Dezhh0JeAgH",
+      "imgur": "dGNdicT"
+    },
+    {
+      "id": "LJZ",
+      "sol": 1.0,
+      "fumen": "v115@PhAtg0FeglBtg0DeilAth0JeAgH",
+      "imgur": "oyvnwRc"
+    },
+    {
+      "id": "ILZ",
+      "sol": 1.0,
+      "fumen": "v115@JhBtFeilBtEeglzhEeJeAgH",
+      "imgur": "O508ak2"
+    },
+    {
+      "id": "ILS",
+      "sol": 1.0,
+      "fumen": "v115@JhglQ4FeilR4EezhQ4EeJeAgH",
+      "imgur": "7Qsu27I"
+    },
+    {
+      "id": "JSO",
+      "sol": 1.0,
+      "fumen": "v115@JhR4Feg0R4RpEei0RpEeJeAgH",
+      "imgur": "wiALWX4"
+    },
+    {
+      "id": "LSO",
+      "sol": 1.0,
+      "fumen": "v115@JhglQ4FeRpglR4EeRphlQ4EeJeAgH",
+      "imgur": "0eWX5JW"
+    },
+    {
+      "id": "IZO",
+      "sol": 1.0,
+      "fumen": "v115@/gwhIewhAeAtEeRpwhBtEeRpwhAtFeJeAgH",
+      "imgur": "xX7e3YE"
+    },
+    {
+      "id": "JSZ",
+      "sol": 0.9738,
+      "fumen": "v115@9gQ4IeR4Heg0Q4BtFei0BtEeJeAgH",
+      "imgur": "x5VryHj"
+    },
+    {
+      "id": "LSZ",
+      "sol": 0.9738,
+      "fumen": "v115@GhAtHeBtFeR4AtglEeR4ilJeAgH",
+      "imgur": "tD6ItP9"
+    },
+    {
+      "id": "ISZ",
+      "sol": 0.9952,
+      "fumen": "v115@ChBtIeBtGeR4GeR4zhJeAgH",
+      "imgur": "kdFNjCM"
+    },
+    {
+      "id": "SZO",
+      "sol": 0.8913,
+      "fumen": "v115@IhAtHeBtR4DeRpAtR4EeRpJeAgH",
+      "imgur": "9o9ehob"
+    },
+    {
+      "id": "TTI",
+      "sol": 1.0,
+      "fumen": "v115@9gywGexwHexwHewwzhEeJeAgH",
+      "imgur": "pReEGOH"
+    },
+    {
+      "id": "TTL",
+      "sol": 1.0,
+      "fumen": "v115@OhwwGezwglDeywilJeAgH",
+      "imgur": "TkE79sk"
+    },
+    {
+      "id": "TTJ",
+      "sol": 1.0,
+      "fumen": "v115@JhwwGeg0zwEei0ywNeAgH",
+      "imgur": "EqHkyZ1"
+    },
+    {
+      "id": "TTS",
+      "sol": 0.9996,
+      "fumen": "v115@FhR4GeR4wwGeywFezwJeAgH",
+      "imgur": "TOIgIvL"
+    },
+    {
+      "id": "TTZ",
+      "sol": 0.9996,
+      "fumen": "v115@9gBtHewwBtGeywGezwFeJeAgH",
+      "imgur": "EBydJwW"
+    },
+    {
+      "id": "TTO",
+      "sol": 1.0,
+      "fumen": "v115@JhwwGeRpywEeRpzwNeAgH",
+      "imgur": "4cXKVxI"
+    },
+    {
+      "id": "TII",
+      "sol": 1.0,
+      "fumen": "v115@FhxhHexhAewwFexhywEexhJeAgH",
+      "imgur": "zIRqkjr"
+    },
+    {
+      "id": "IIL",
+      "sol": 1.0,
+      "fumen": "v115@9gwhIewhBeglFewhilFe0hEeJeAgH",
+      "imgur": "NzfmpQJ"
+    },
+    {
+      "id": "IIJ",
+      "sol": 1.0,
+      "fumen": "v115@GhwhFeg0BewhFei0whEe0hJeAgH",
+      "imgur": "ZGhXFJz"
+    },
+    {
+      "id": "IIO",
+      "sol": 1.0,
+      "fumen": "v115@FhxhHexhRpFexhRpFexhJeAgH",
+      "imgur": "SeVq69E"
+    },
+    {
+      "id": "IIS",
+      "sol": 1.0,
+      "fumen": "v115@9gwhIewhIewhCeR4DewhBeR4zhAeJeAgH",
+      "imgur": "RoVFFZk"
+    },
+    {
+      "id": "IIZ",
+      "sol": 1.0,
+      "fumen": "v115@GhwhIewhDeBtCewhAezhBtBewhJeAgH",
+      "imgur": "AVXZwSw"
+    },
+    {
+      "id": "TLL",
+      "sol": 1.0,
+      "fumen": "v115@9ghlHehlHehlAewwFehlywEeJeAgH",
+      "imgur": "ZiCE2hh"
+    },
+    {
+      "id": "ILL",
+      "sol": 1.0,
+      "fumen": "v115@RhilEeglAeglzhAeilAeJeAgH",
+      "imgur": "wftAYQJ"
+    },
+    {
+      "id": "LLJ",
+      "sol": 1.0,
+      "fumen": "v115@9ghlHehlHehlg0Gehli0EeJeAgH",
+      "imgur": "AeusQJ7"
+    },
+    {
+      "id": "LLO",
+      "sol": 1.0,
+      "fumen": "v115@PhhlFeglRpglDeilRpglJeAgH",
+      "imgur": "JHgDy6r"
+    },
+    {
+      "id": "LLS",
+      "sol": 1.0,
+      "fumen": "v115@PhR4FeglR4glDellJeAgH",
+      "imgur": "jv6ZCV5"
+    },
+    {
+      "id": "LLZ",
+      "sol": 1.0,
+      "fumen": "v115@9gglIeglCeAtEeilBtEeilAtFeJeAgH",
+      "imgur": "0q6Enss"
+    },
+    {
+      "id": "TJJ",
+      "sol": 1.0,
+      "fumen": "v115@Fhh0Heh0FewwAeh0Eeywh0JeAgH",
+      "imgur": "1RFagmN"
+    },
+    {
+      "id": "IJJ",
+      "sol": 1.0,
+      "fumen": "v115@Shg0Eei0Aei0Aezhg0JeAgH",
+      "imgur": "3gZWWfD"
+    },
+    {
+      "id": "LJJ",
+      "sol": 1.0,
+      "fumen": "v115@Fhh0Heh0Geglh0Eeilh0JeAgH",
+      "imgur": "FGvaAC1"
+    },
+    {
+      "id": "JJO",
+      "sol": 1.0,
+      "fumen": "v115@Hhh0Heg0Rpg0Feg0Rpi0DeJeAgH",
+      "imgur": "DdiRp9N"
+    },
+    {
+      "id": "JJS",
+      "sol": 1.0,
+      "fumen": "v115@Ghg0EeQ4Ceg0EeR4i0FeQ4i0JeAgH",
+      "imgur": "wx18fdU"
+    },
+    {
+      "id": "JJZ",
+      "sol": 1.0,
+      "fumen": "v115@HhBtHeg0Btg0Fel0DeJeAgH",
+      "imgur": "pgIpt4A"
+    },
+    {
+      "id": "TOO",
+      "sol": 1.0,
+      "fumen": "v115@FhRpHeRpFewwAeRpEeywRpJeAgH",
+      "imgur": "zWIL14B"
+    },
+    {
+      "id": "IOO",
+      "sol": 1.0,
+      "fumen": "v115@EhRpwhGeRpwhGeRpwhGeRpwhJeAgH",
+      "imgur": "30oRlqS"
+    },
+    {
+      "id": "LOO",
+      "sol": 1.0,
+      "fumen": "v115@NhhlGeRpglRpEeRpglRpJeAgH",
+      "imgur": "Mxtsluv"
+    },
+    {
+      "id": "JOO",
+      "sol": 1.0,
+      "fumen": "v115@Jhh0FeRpg0RpEeRpg0RpOeAgH",
+      "imgur": "BpcFEtv"
+    },
+    {
+      "id": "SOO",
+      "sol": 0.9901,
+      "fumen": "v115@9gRpHeRpHeRpCeR4CeRpBeR4DeJeAgH",
+      "imgur": "UGQ4Z7t"
+    },
+    {
+      "id": "ZOO",
+      "sol": 0.9901,
+      "fumen": "v115@FhRpHeRpCeBtCeRpDeBtBeRpJeAgH",
+      "imgur": "ICcQtk2"
+    },
+    {
+      "id": "TSS",
+      "sol": 1.0,
+      "fumen": "v115@/gR4GeR4HeR4wwFeR4ywEeJeAgH",
+      "imgur": "8lJZdOQ"
+    },
+    {
+      "id": "ISS",
+      "sol": 0.9917,
+      "fumen": "v115@LhR4GeT4CezhR4DeJeAgH",
+      "imgur": "SuB1jZ4"
+    },
+    {
+      "id": "SSO",
+      "sol": 0.9873,
+      "fumen": "v115@KhR4GeT4BeRpCeR4CeRpJeAgH",
+      "imgur": "xNBCH5J"
+    },
+    {
+      "id": "SSZ",
+      "sol": 0.856,
+      "fumen": "v115@AhBtIeBtGeT4EeT4DeJeAgH",
+      "imgur": "qa7AKXn"
+    },
+    {
+      "id": "TZZ",
+      "sol": 1.0,
+      "fumen": "v115@DhBtIeBtGewwBtFeywBtJeAgH",
+      "imgur": "LrnHs7Y"
+    },
+    {
+      "id": "IZZ",
+      "sol": 0.9917,
+      "fumen": "v115@LhBtGeDtGeBtzhJeAgH",
+      "imgur": "fEsWJn2"
+    },
+    {
+      "id": "ZZO",
+      "sol": 0.9873,
+      "fumen": "v115@MhBtCeRpBeDtBeRpCeBtCeJeAgH",
+      "imgur": "spSGmPR"
+    },
+    {
+      "id": "SZZ",
+      "sol": 0.856,
+      "fumen": "v115@ChR4GeR4GeDtGeDtBeJeAgH",
+      "imgur": "uWkWOcB"
+    }
+  ]
+}

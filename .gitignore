@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+debug_screenshot.png
+*.log
+
+Setup Konbini.xlsx
+
+tools/setup_finder/__pycache__/
+
+# Hydra 대용량/실행 중 생성 파일
+tools/hydra/graph.bin
+tools/hydra/tree_data.js
+
+# 빌드 결과물 제외하고 싶으면 이것도 켜기
+# tools/hydra/hydra_solver.exe
