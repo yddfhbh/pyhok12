@@ -537,19 +537,19 @@ class TetrisScannerApp:
         start_x = 8
         start_y = 8
 
-        for index, variant in enumerate(variants[:2]):
+        for index, variant in enumerate(variants[:4]):
             col = index % 2
             row = index // 2
             x = start_x + col * (card_width + gap_x)
             y = start_y + row * (card_height + gap_y)
             self.draw_setup_card(x, y, card_width, card_height, variant)
 
-        bottom = start_y + ((len(variants[:2]) + 1) // 2) * (card_height + gap_y)
+        bottom = start_y + ((len(variants[:4]) + 1) // 2) * (card_height + gap_y)
         self.output.config(scrollregion=(0, 0, self.solve_canvas_width, max(bottom, self.solve_canvas_height)))
         self.output_hint_var.set(
             "\n".join(
                 f"{variant['title']}: {variant['setup']['id']} / {variant['queue_text'][:3]}"
-                for variant in variants[:2]
+                for variant in variants[:4]
             )
         )
 
@@ -632,7 +632,7 @@ class TetrisScannerApp:
         pieces_count = result.get("pieces_count")
         round_from_counter = result.get("pc_round")
 
-        if not self.has_single_top_active_piece(board, active):
+        if not self.should_show_setup_recommendation(result):
             return []
 
         candidates = []
@@ -678,6 +678,27 @@ class TetrisScannerApp:
             seen_ids.add(setup_id)
 
         return variants
+
+    def count_visible_cells(self, board):
+        count = 0
+        for row in board or []:
+            for cell in row:
+                if cell in VISIBLE_FIELD_PIECES:
+                    count += 1
+        return count
+
+
+    def should_show_setup_recommendation(self, result):
+        board = result.get("board") or []
+        active = result.get("active_guess") or ""
+
+        # 상단 active 미노 하나가 제대로 잡힌 상황이 아니면 셋업 추천 X
+        if not self.has_single_top_active_piece(board, active):
+            return False
+
+        # 현재 낙하 미노만 있으면 보통 4칸.
+        # 5칸 이상이면 이미 바닥에 놓인 블럭이 있다고 판단.
+        return self.count_visible_cells(board) <= 4    
 
     def has_single_top_active_piece(self, board, active):
         if not board or not active or active not in VISIBLE_FIELD_PIECES:
@@ -905,10 +926,11 @@ class TetrisScannerApp:
             else:
                 self.print_message("스캔 완료.\nHydra 계산을 누르면 해법 카드가 표시됩니다.")
                 self.status_label.config(text=f"스캔 완료{round_text}")
+                self.run_hydra_now(show_popup=False)
         else:
             self.status_label.config(text="스캔 완료 (변화 없음)")
 
-        if self.hydra_auto_var.get() and not same_scan:
+        if self.hydra_auto_var.get() and not same_scan and setup_variants:
             self.run_hydra_now(show_popup=False)
 
     def _on_scan_error(self, error_text, show_popup):
