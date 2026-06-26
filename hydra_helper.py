@@ -407,42 +407,161 @@ def hydra_hash_to_rows(board_hash):
         rows.append("".join("X" if bit == "1" else "." for bit in row_bits))
     return rows
 
+def rows_to_hydra_hash(rows):
+    value = 0
+    for line in rows:
+        for ch in line:
+            value <<= 1
+            if ch == "X":
+                value += 1
+    return value
+
+
+def normalize_hash_rows(rows):
+    normalized = []
+    for row in rows[:4]:
+        row_text = row if isinstance(row, str) else "".join(row)
+        normalized.append((row_text + "." * 10)[:10])
+
+    while len(normalized) < 4:
+        normalized.insert(0, "." * 10)
+
+    full_rows = [line for line in normalized if line == "X" * 10]
+    not_full_rows = [line for line in normalized if line != "X" * 10]
+    return not_full_rows + full_rows
+
+
+def clear_full_rows_4(rows):
+    kept = [line for line in rows if line != "X" * 10]
+    while len(kept) < 4:
+        kept.insert(0, "." * 10)
+    return kept[-4:]
+
+
+PIECE_ORIENTATIONS = {
+    "I": [
+        [(0, 0), (0, 1), (0, 2), (0, 3)],
+        [(0, 0), (1, 0), (2, 0), (3, 0)],
+    ],
+    "O": [
+        [(0, 0), (0, 1), (1, 0), (1, 1)],
+    ],
+    "T": [
+        [(0, 0), (0, 1), (0, 2), (1, 1)],
+        [(0, 1), (1, 0), (1, 1), (2, 1)],
+        [(0, 1), (1, 0), (1, 1), (1, 2)],
+        [(0, 0), (1, 0), (1, 1), (2, 0)],
+    ],
+    "J": [
+        [(0, 0), (1, 0), (1, 1), (1, 2)],
+        [(0, 0), (0, 1), (1, 0), (2, 0)],
+        [(0, 0), (0, 1), (0, 2), (1, 2)],
+        [(0, 1), (1, 1), (2, 0), (2, 1)],
+    ],
+    "L": [
+        [(0, 2), (1, 0), (1, 1), (1, 2)],
+        [(0, 0), (1, 0), (2, 0), (2, 1)],
+        [(0, 0), (0, 1), (0, 2), (1, 0)],
+        [(0, 0), (0, 1), (1, 1), (2, 1)],
+    ],
+    "S": [
+        [(0, 1), (0, 2), (1, 0), (1, 1)],
+        [(0, 0), (1, 0), (1, 1), (2, 1)],
+    ],
+    "Z": [
+        [(0, 0), (0, 1), (1, 1), (1, 2)],
+        [(0, 1), (1, 0), (1, 1), (2, 0)],
+    ],
+}
+
+
+def infer_piece_placement_rows(prev_hash, next_hash, piece):
+    if prev_hash is None or next_hash is None or piece not in PIECE_ORIENTATIONS:
+        return None
+
+    prev_rows = hydra_hash_to_rows(prev_hash)
+    target_hash = int(next_hash)
+    base = [list(row) for row in prev_rows]
+
+    best_visible = None
+    best_visible_count = -1
+
+    for shape in PIECE_ORIENTATIONS[piece]:
+        max_r = max(r for r, _ in shape)
+        max_c = max(c for _, c in shape)
+
+        # 중요:
+        # top을 음수까지 허용한다.
+        # 실제 미노가 4줄 PC 영역 위로 걸쳐도,
+        # 아래 4줄에 보이는 칸만 hash에 반영될 수 있음.
+        for top in range(-max_r, 4):
+            for left in range(0, 10 - max_c):
+                absolute_cells = [(top + r, left + c) for r, c in shape]
+                visible_cells = [
+                    (r, c)
+                    for r, c in absolute_cells
+                    if 0 <= r < 4 and 0 <= c < 10
+                ]
+
+                if not visible_cells:
+                    continue
+
+                if any(base[r][c] == "X" for r, c in visible_cells):
+                    continue
+
+                placed_board = [row[:] for row in base]
+                placed_only = [["." for _ in range(10)] for _ in range(4)]
+
+                for r, c in visible_cells:
+                    placed_board[r][c] = "X"
+                    placed_only[r][c] = "X"
+
+                placed_rows = ["".join(row) for row in placed_board]
+
+                candidates = [
+                    placed_rows,
+                    normalize_hash_rows(placed_rows),
+                    clear_full_rows_4(placed_rows),
+                ]
+
+                if any(rows_to_hydra_hash(candidate) == target_hash for candidate in candidates):
+                    visible_count = len(visible_cells)
+
+                    # 4칸 다 보이는 배치를 우선,
+                    # 아니면 가장 많이 보이는 배치를 fallback으로 사용
+                    if visible_count > best_visible_count:
+                        best_visible_count = visible_count
+                        best_visible = ["".join(row) for row in placed_only]
+
+                    if visible_count == 4:
+                        return best_visible
+
+    return best_visible
+
+
+def make_hydra_step(piece, prev_hash, next_hash):
+    placed_rows = infer_piece_placement_rows(prev_hash, next_hash, piece)
+
+    return {
+        "piece": piece,
+        "hash": next_hash,
+        "rows": hydra_hash_to_rows(next_hash),
+        "prev_hash": prev_hash,
+        "prev_rows": hydra_hash_to_rows(prev_hash) if prev_hash is not None else None,
+        "placed_rows": placed_rows,
+    }
+
 
 def extract_hydra_solution(data, init_hash=None):
     if not data:
         return None
 
     if is_hydra_solve_path(data):
-        pieces = []
-        steps = []
-        previous_hash = init_hash
-        for item in data[1:]:
-            if not isinstance(item, list) or len(item) < 2:
-                continue
-            board_hash = item[0]
-            piece_index = item[1]
-            if isinstance(piece_index, int) and 0 <= piece_index < len(PIECE_PRIORITY):
-                piece = PIECE_PRIORITY[piece_index]
-                pieces.append(piece)
-                steps.append(
-                    {
-                        "piece": piece,
-                        "hash": board_hash,
-                        "rows": hydra_hash_to_rows(board_hash),
-                        "prev_hash": previous_hash,
-                        "prev_rows": hydra_hash_to_rows(previous_hash) if previous_hash is not None else None,
-                    }
-                )
-                previous_hash = board_hash
+        return extract_solve_path_solution(data, init_hash=init_hash)
 
-        return {
-            "mode": "solve_path",
-            "pieces": pieces,
-            "steps": steps,
-            "text": " -> ".join(pieces) if pieces else "(no moves)",
-            "init_hash": init_hash,
-            "init_rows": hydra_hash_to_rows(init_hash) if init_hash is not None else None,
-        }
+    best_solution = extract_best_branch_solution(data, init_hash=init_hash)
+    if best_solution:
+        return best_solution
 
     pieces = extract_best_branch_pieces(data)
     if not pieces:
@@ -458,6 +577,113 @@ def extract_hydra_solution(data, init_hash=None):
     }
 
 
+def extract_solve_path_solution(data, init_hash=None):
+    pieces = []
+    steps = []
+    previous_hash = init_hash
+
+    for item in data[1:]:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+
+        board_hash = item[0]
+        piece_index = item[1]
+
+        if not isinstance(piece_index, int) or not (0 <= piece_index < len(PIECE_PRIORITY)):
+            continue
+
+        piece = PIECE_PRIORITY[piece_index]
+        pieces.append(piece)
+        steps.append(make_hydra_step(piece, previous_hash, board_hash))
+        previous_hash = board_hash
+
+    return {
+        "mode": "solve_path",
+        "pieces": pieces,
+        "steps": steps,
+        "text": " -> ".join(pieces) if pieces else "(no moves)",
+        "init_hash": init_hash,
+        "init_rows": hydra_hash_to_rows(init_hash) if init_hash is not None else None,
+    }
+
+
+def extract_best_branch_solution(node, init_hash=None):
+    pieces = []
+    steps = []
+
+    previous_hash = init_hash
+    current = node
+
+    for _ in range(20):
+        if is_hydra_solve_path(current):
+            tail = extract_solve_path_solution(current, init_hash=previous_hash)
+            if tail:
+                pieces.extend(tail.get("pieces") or [])
+                steps.extend(tail.get("steps") or [])
+            break
+
+        if not isinstance(current, list) or len(current) < 4:
+            break
+
+        piece_index = current[1]
+        children = current[3]
+
+        if not isinstance(piece_index, int) or not (0 <= piece_index < len(PIECE_PRIORITY)):
+            break
+
+        if not isinstance(children, list) or not children:
+            break
+
+        best_child = None
+        best_child_score = float("-inf")
+
+        for child in children:
+            score = hydra_node_score(child)
+            if score > best_child_score:
+                best_child_score = score
+                best_child = child
+
+        if best_child is None:
+            break
+
+        piece = PIECE_PRIORITY[piece_index]
+
+        # best_child가 solve path면 보드 hash로 취급하지 말고 바로 tail 처리
+        if is_hydra_solve_path(best_child):
+            pieces.append(piece)
+
+            tail = extract_solve_path_solution(best_child, init_hash=previous_hash)
+            if tail:
+                pieces.extend(tail.get("pieces") or [])
+                steps.extend(tail.get("steps") or [])
+            break
+
+        next_hash = None
+        if isinstance(best_child, list) and best_child:
+            candidate_hash = best_child[0]
+            if isinstance(candidate_hash, int):
+                next_hash = candidate_hash
+
+        pieces.append(piece)
+
+        if next_hash is not None:
+            steps.append(make_hydra_step(piece, previous_hash, next_hash))
+            previous_hash = next_hash
+
+        current = best_child
+
+    if not pieces:
+        return None
+
+    return {
+        "mode": "best_branch",
+        "pieces": pieces,
+        "steps": steps,
+        "text": " -> ".join(pieces),
+        "init_hash": init_hash,
+        "init_rows": hydra_hash_to_rows(init_hash) if init_hash is not None else None,
+    }
+
 def is_hydra_solve_path(node):
     return (
         isinstance(node, list)
@@ -465,7 +691,6 @@ def is_hydra_solve_path(node):
         and isinstance(node[0], list)
         and len(node[0]) == 1
     )
-
 
 def extract_best_branch_pieces(node):
     if is_hydra_solve_path(node):

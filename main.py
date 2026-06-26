@@ -8,7 +8,7 @@ except Exception:
     decode_fumen = None
 
 try:
-    from tools.setup_finder.setup_finder import find_setups
+    from tools.setup_finder.setup_finder import find_setup_for_pc
 except Exception:
     find_setups = None
 
@@ -21,7 +21,25 @@ from hydra_helper import (
 )
 from recognizer import VISIBLE_FIELD_PIECES, load_config, recognize_all
 from scanner import capture_screen, save_debug_screenshot
-
+PC_BAG_TABLE = [
+        [1, 1, 1, 1, 1, 1, 1, 2, 2, 2],       # 1회차: 7+3
+        [2, 2, 2, 2, 3, 3, 3, 3, 3, 3],       # 2회차: 4+6
+        [3, 4, 4, 4, 4, 4, 4, 4, 5, 5],       # 3회차: 1+7+2
+        [5, 5, 5, 5, 5, 6, 6, 6, 6, 6],       # 4회차: 5+5
+        [6, 6, 7, 7, 7, 7, 7, 7, 7, 8],       # 5회차: 2+7+1
+        [8, 8, 8, 8, 8, 8, 9, 9, 9, 9],       # 6회차: 6+4
+        [9, 9, 9, 10, 10, 10, 10, 10, 10, 10], # 7회차: 3+7
+]
+PC_STRUCTURES = {
+        1: "7+3",
+        2: "4+6",
+        3: "1+7+2",
+        4: "5+5",
+        5: "2+7+1",
+        6: "6+4",
+        7: "3+7",
+}    
+    
 
 class TetrisScannerApp:
     def __init__(self, root):
@@ -109,7 +127,13 @@ class TetrisScannerApp:
             font=("Malgun Gothic", 10),
         )
         self.topmost_check.pack(pady=(0, 4))
-
+        self.pc_round_label = tk.Label(
+            root,
+            text="현재 PC: -",
+            font=("Malgun Gothic", 10, "bold"),
+            anchor="w",
+        )
+        self.pc_round_label.pack(fill="x", padx=16, pady=(0, 4))
         self.hydra_frame = tk.LabelFrame(
             root,
             text="HYDRA PC SOLVER",
@@ -247,6 +271,7 @@ class TetrisScannerApp:
         self.draw_empty_board()
         self.print_message("기본은 수동 스캔입니다.\n스캔 후 추천 셋업 또는 Hydra 해법이 표시됩니다.")
         self.root.after(150, self.start_hydra_warmup)
+        self.last_hydra_signature = None
 
     def print_message(self, text):
         self.clear_output_view(text)
@@ -300,6 +325,7 @@ class TetrisScannerApp:
 
         self.is_hydra_warming = True
         self.hydra_result_label.config(text="HYDRA: 예열 중...")
+
         worker = threading.Thread(target=self._hydra_warmup_worker, daemon=True)
         worker.start()
 
@@ -337,6 +363,122 @@ class TetrisScannerApp:
         else:
             self.status_label.config(text="창 항상 위 고정 OFF")
 
+    def get_pc_round_info(self, result):
+        pieces_count = result.get("pieces_count")
+
+        if pieces_count is not None:
+            try:
+                pieces = int(float(pieces_count))
+                if pieces < 0:
+                    pieces = 0
+
+                cycle_pieces = pieces % 70
+                pc_round = cycle_pieces // 10 + 1
+                pc_progress = cycle_pieces % 10
+                bag_in_cycle = PC_BAG_TABLE[pc_round - 1][pc_progress]
+                structure = PC_STRUCTURES.get(pc_round, "-")
+
+                return {
+                    "pieces_count": pieces,
+                    "cycle_pieces": cycle_pieces,
+                    "pc_round": pc_round,
+                    "pc_progress": pc_progress,
+                    "bag_in_cycle": bag_in_cycle,
+                    "structure": structure,
+                    "source": "pieces",
+                }
+            except (TypeError, ValueError):
+                pass
+
+        fallback_round = result.get("pc_round")
+        if fallback_round is not None:
+            try:
+                round_num = int(float(fallback_round))
+                if round_num <= 0:
+                    round_num = 1
+
+                round_num = ((round_num - 1) % 7) + 1
+                structure = PC_STRUCTURES.get(round_num, "-")
+
+                return {
+                    "pieces_count": None,
+                    "cycle_pieces": None,
+                    "pc_round": round_num,
+                    "pc_progress": None,
+                    "bag_in_cycle": None,
+                    "structure": structure,
+                    "source": "pc_round",
+                }
+            except (TypeError, ValueError):
+                pass
+
+        # pieces OCR이 실패했더라도, 보드에 현재 active 미노만 잡힌 상태면
+        # 게임 시작 직후 0p = 1회차로 본다.
+        board = result.get("board") or []
+        active = result.get("active_guess") or ""
+
+        try:
+            if active and self.has_single_top_active_piece(board, active) and self.count_visible_cells(board) <= 4:
+                pieces = 0
+                cycle_pieces = 0
+                pc_round = 1
+                pc_progress = 0
+                bag_in_cycle = PC_BAG_TABLE[0][0]
+                structure = PC_STRUCTURES.get(1, "-")
+
+                return {
+                    "pieces_count": pieces,
+                    "cycle_pieces": cycle_pieces,
+                    "pc_round": pc_round,
+                    "pc_progress": pc_progress,
+                    "bag_in_cycle": bag_in_cycle,
+                    "structure": structure,
+                    "source": "active_only_fallback",
+                }
+        except Exception:
+            pass
+
+        return {
+            "pieces_count": None,
+            "cycle_pieces": None,
+            "pc_round": None,
+            "pc_progress": None,
+            "bag_in_cycle": None,
+            "structure": "-",
+            "source": "unknown",
+        }
+
+
+    def format_pc_round_info(self, result):
+        info = self.get_pc_round_info(result)
+
+        if info["pc_round"] is None:
+            return "현재 PC: 인식 실패"
+
+        if info["source"] == "active_only_fallback":
+            return (
+                f"현재 PC: {info['pc_round']}회차 | "
+                f"{info['pc_progress']}/10p | "
+                f"총 {info['pieces_count']}p | "
+                f"가방 {info['bag_in_cycle']} | "
+                f"구조 {info['structure']} | 추정"
+            )
+
+        if info["pieces_count"] is None:
+            return (
+                f"현재 PC: {info['pc_round']}회차 | "
+                f"pieces 인식 실패 | "
+                f"구조 {info['structure']}"
+            )
+
+        return (
+            f"현재 PC: {info['pc_round']}회차 | "
+            f"{info['pc_progress']}/10p | "
+            f"총 {info['pieces_count']}p | "
+            f"가방 {info['bag_in_cycle']} | "
+            f"구조 {info['structure']}"
+        )
+
     def run_hydra_now(self, show_popup=True):
         if self.is_hydra_running or self.is_closing:
             return
@@ -361,6 +503,22 @@ class TetrisScannerApp:
             self.print_message("ACTIVE 인식이 잡히면 Hydra 계산이 시작됩니다.")
             return
 
+        hydra_signature = (
+            tuple("".join(row) for row in board),
+            active_guess,
+            hold,
+            tuple(queue),
+            active,
+            manual_see,
+            bag_arg,
+        )
+
+        if not show_popup and hydra_signature == self.last_hydra_signature:
+            self.status_label.config(text="Hydra 계산 생략 - 같은 상태")
+            return
+
+        self.last_hydra_signature = hydra_signature
+
         self.is_hydra_running = True
         self.hydra_button.config(state="disabled")
         if show_popup or self.current_output_mode != "setup":
@@ -380,46 +538,65 @@ class TetrisScannerApp:
         self.output.delete("all")
         self.current_output_mode = "hydra"
 
-        y = 8
+        card_width = 260
+        card_height = 120
+        gap_y = 12
+        start_x = 8
+        start_y = 8
+
         summary_lines = []
-        for index, variant in enumerate(variants[:3], start=1):
-            title = variant.get("title") or f"{index}. 해법"
+
+        visible = variants[:2]  # ACTIVE / HOLD 정도만 보여주기
+
+        for index, variant in enumerate(visible):
+            y = start_y + index * (card_height + gap_y)
+            self.draw_solution_compact_card(
+                start_x,
+                y,
+                card_width,
+                card_height,
+                variant,
+            )
+
             solution = variant.get("solution") or {}
             pieces = solution.get("pieces") or []
-            steps = solution.get("steps") or []
-
-            self.output.create_text(
-                10,
-                y + 10,
-                text=title,
-                anchor="w",
-                fill="#252525",
-                font=("Consolas", 10, "bold"),
-            )
-            y += 20
-
-            if steps:
-                y = self.draw_solution_step_row(steps, y)
-            else:
-                y = self.draw_solution_piece_row(pieces, y)
-
+            title = variant.get("title") or f"{index + 1}. 해법"
             summary_lines.append(f"{title}: {' -> '.join(pieces)}")
-            y += 16
 
-        self.output.config(scrollregion=(0, 0, self.solve_canvas_width, max(y, self.solve_canvas_height)))
+        bottom = start_y + len(visible) * (card_height + gap_y)
+        self.output.config(
+            scrollregion=(0, 0, self.solve_canvas_width, max(bottom, self.solve_canvas_height))
+        )
         self.output_hint_var.set("\n".join(summary_lines))
 
     def draw_solution_step_row(self, steps, start_y):
         card_width = 84
         card_height = 62
         gap_x = 10
+        gap_y = 8
         start_x = 8
+        cards_per_row = 3
 
-        for index, step in enumerate(steps[:3]):
-            x = start_x + index * (card_width + gap_x)
-            self.draw_solution_step_card(x, start_y, card_width, card_height, index + 1, step)
+        visible_steps = steps[:9]  # 너무 길어도 최대 9개까지만 표시
 
-        return start_y + card_height
+        for index, step in enumerate(visible_steps):
+            col = index % cards_per_row
+            row = index // cards_per_row
+
+            x = start_x + col * (card_width + gap_x)
+            y = start_y + row * (card_height + gap_y)
+
+            self.draw_solution_step_card(
+                x,
+                y,
+                card_width,
+                card_height,
+                index + 1,
+                step,
+            )
+
+        row_count = (len(visible_steps) + cards_per_row - 1) // cards_per_row
+        return start_y + row_count * card_height + max(0, row_count - 1) * gap_y
 
     def draw_solution_piece_row(self, pieces, start_y):
         card_width = 84
@@ -526,6 +703,133 @@ class TetrisScannerApp:
                     outline="#ece7da",
                 )
 
+    def clear_preview_full_rows(self, board):
+        kept = []
+
+        for row in board:
+            # 색 상관없이 10칸 다 차 있으면 full row로 보고 제거
+            if all(cell != "." for cell in row):
+                continue
+            kept.append(row[:])
+
+        while len(kept) < 4:
+            kept.insert(0, list("." * 10))
+
+        return kept[-4:]
+
+    def build_compact_solution_rows(self, solution):
+        if not solution:
+            return []
+
+        steps = solution.get("steps") or []
+        init_rows = solution.get("init_rows") or []
+
+        if not init_rows and steps:
+            init_rows = steps[0].get("prev_rows") or []
+
+        if not init_rows:
+            init_rows = ["." * 10 for _ in range(4)]
+
+        board = []
+        for row in init_rows[:4]:
+            row_text = row if isinstance(row, str) else "".join(row)
+            row_text = (row_text + "." * 10)[:10]
+            board.append(list(row_text))
+
+        while len(board) < 4:
+            board.insert(0, list("." * 10))
+
+        # 초기 스택은 회색으로 표시
+        for r in range(4):
+            for c in range(10):
+                if board[r][c] != ".":
+                    board[r][c] = "X"
+
+        for step in steps:
+            piece = step.get("piece", "X")
+            placed_rows = step.get("placed_rows")
+
+            # placed_rows를 우선 신뢰
+            if placed_rows:
+                for r in range(min(4, len(placed_rows))):
+                    row = placed_rows[r]
+                    for c in range(min(10, len(row))):
+                        if row[c] == "X":
+                            board[r][c] = piece
+
+                # 한 수 둘 때마다 줄 삭제 반영
+                board = self.clear_preview_full_rows(board)
+                continue
+
+            # placed_rows를 못 구한 경우엔 아예 색칠을 생략하는 편이 더 안전함
+            # (기존 fallback은 line clear가 있으면 색이 자주 틀어짐)
+            continue
+
+        return ["".join(row) for row in board]
+
+    def draw_solution_compact_card(self, x, y, width, height, variant):
+        solution = variant.get("solution") or {}
+        title = variant.get("title") or "해법"
+        pieces = solution.get("pieces") or []
+
+        preview_rows = self.build_compact_solution_rows(solution)
+
+        self.output.create_rectangle(
+            x,
+            y,
+            x + width,
+            y + height,
+            fill="#f4f1e8",
+            outline="#dfd9ca",
+        )
+
+        self.output.create_text(
+            x + 10,
+            y + 12,
+            text=title,
+            anchor="w",
+            fill="#252525",
+            font=("Consolas", 10, "bold"),
+        )
+
+        # 통합 보드 미리보기
+        if preview_rows and any(any(ch not in ".X" for ch in row) for row in preview_rows):
+            self.draw_preview_board(
+                preview_rows,
+                x + 10,
+                y + 24,
+                cell_size=12,
+            )
+        else:
+            self.output.create_text(
+                x + 10,
+                y + 42,
+                text="배치 미리보기 불안정\n순서만 표시",
+                anchor="w",
+                fill="#8f6f4a",
+                font=("Malgun Gothic", 9, "bold"),
+            )
+
+        # 해법 순서 텍스트
+        piece_text = " -> ".join(pieces) if pieces else "-"
+        self.output.create_text(
+            x + 10,
+            y + 80,
+            text=piece_text,
+            anchor="w",
+            fill="#252525",
+            font=("Consolas", 9, "bold"),
+        )
+
+        # 작은 색상 strip
+        self.draw_piece_strip(
+            "".join(pieces[:10]),
+            x + 10,
+            y + 92,
+            block_size=10,
+            gap=2,
+        )
+
     def render_setup_groups(self, variants):
         self.output.delete("all")
         self.current_output_mode = "setup"
@@ -622,17 +926,24 @@ class TetrisScannerApp:
         )
 
     def build_setup_variants(self, result):
-        if find_setups is None:
+        if find_setup_for_pc is None:
             return []
 
         board = result.get("board") or []
         active = result.get("active_guess") or ""
         hold = result.get("hold") or ""
         queue = [piece for piece in result.get("queue", []) if piece]
-        pieces_count = result.get("pieces_count")
-        round_from_counter = result.get("pc_round")
+        round_info = self.get_pc_round_info(result)
+        pieces_count = round_info["pieces_count"]
+        round_from_counter = round_info["pc_round"]
+        pc_progress = round_info["pc_progress"]
+        bag_in_cycle = round_info["bag_in_cycle"]
+        
 
-        if not self.should_show_setup_recommendation(result):
+        if not active:
+            return []
+
+        if round_from_counter not in (1, 7):
             return []
 
         candidates = []
@@ -644,24 +955,26 @@ class TetrisScannerApp:
         seen_ids = set()
         for title, queue_text in candidates:
             try:
-                found = find_setups(queue_text)
+                found = find_setup_for_pc(queue_text, round_from_counter)
             except Exception:
                 continue
 
-            seventh = found.get("seventh") or {}
-            if not seventh.get("ok"):
+            if not found.get("ok"):
                 continue
 
-            setup = seventh.get("result") or {}
+            setup = found.get("result") or {}
             setup_id = setup.get("id")
             if not setup_id or setup_id in seen_ids:
                 continue
 
-            round_num = round_from_counter or seventh.get("pc")
-            if round_num and pieces_count is not None:
-                round_text = f"{round_num}회차 | {pieces_count}p"
-            elif round_num:
-                round_text = f"{round_num}회차"
+            if round_from_counter is not None and pieces_count is not None:
+                round_text = (
+                    f"{round_from_counter}회차 | "
+                    f"{pc_progress}/10p | "
+                    f"B{bag_in_cycle}"
+                )
+            elif round_from_counter is not None:
+                round_text = f"{round_from_counter}회차"
             elif pieces_count is not None:
                 round_text = f"{pieces_count}p"
             else:
@@ -704,20 +1017,32 @@ class TetrisScannerApp:
         if not board or not active or active not in VISIBLE_FIELD_PIECES:
             return False
 
+        rows = len(board)
+        cols = len(board[0]) if rows else 0
+
+        # 아래 5칸은 제외하고, 그 위에 있는 active 덩어리를 현재 조작 미노로 봄
+        active_search_bottom = max(0, rows - 5)
+
         cells = []
-        top_rows = min(4, len(board))
-        for row_index in range(top_rows):
+        for row_index in range(active_search_bottom):
             for col_index, piece in enumerate(board[row_index]):
                 if piece in VISIBLE_FIELD_PIECES:
                     cells.append((row_index, col_index, piece))
 
-        if not cells or len(cells) > 4:
+        if not cells:
             return False
 
-        if any(piece != active for _, _, piece in cells):
+        # active 후보 영역에 여러 종류가 섞이면 셋업 추천은 하지 않음
+        active_cells = [(r, c) for r, c, piece in cells if piece == active]
+        other_cells = [(r, c, piece) for r, c, piece in cells if piece != active]
+
+        if other_cells:
             return False
 
-        remaining = {(r, c) for r, c, _ in cells}
+        if len(active_cells) > 4:
+            return False
+
+        remaining = set(active_cells)
         stack = [next(iter(remaining))]
         seen = set()
 
@@ -725,9 +1050,10 @@ class TetrisScannerApp:
             cell = stack.pop()
             if cell in seen:
                 continue
-            seen.add(cell)
 
+            seen.add(cell)
             r, c = cell
+
             for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 nxt = (r + dr, c + dc)
                 if nxt in remaining and nxt not in seen:
@@ -894,44 +1220,91 @@ class TetrisScannerApp:
 
     def _scan_worker(self, show_popup):
         try:
+            import time
+
+            print("[SCAN] start")
             monitor_index = self.config.get("monitor_index", 1)
+
+            t0 = time.time()
+            print("[SCAN] capture start")
             img = capture_screen(monitor_index)
+            print(f"[SCAN] capture done {time.time() - t0:.3f}s")
+
+            t1 = time.time()
+            print("[SCAN] recognize start")
             result = recognize_all(img, self.config)
+            print(f"[SCAN] recognize done {time.time() - t1:.3f}s")
+            print(
+                "[SCAN RESULT]",
+                "pieces_count=", result.get("pieces_count"),
+                "pc_round=", result.get("pc_round"),
+                "active=", result.get("active_guess"),
+                "hold=", result.get("hold"),
+                "queue=", result.get("queue"),
+            )
+
             self._post_to_ui(self._on_scan_success, img, result)
+
         except Exception as exc:
+            print("[SCAN ERROR]", repr(exc))
             self._post_to_ui(self._on_scan_error, str(exc), show_popup)
+
         finally:
+            print("[SCAN] finished")
             self._post_to_ui(self._on_scan_finished)
 
     def _on_scan_success(self, img, result):
         self.last_screenshot = img
         self.last_result = result
+        self.pc_round_label.config(text=self.format_pc_round_info(result))
 
+        print(
+            "[SCAN RESULT]",
+            "pieces_count=", result.get("pieces_count"),
+            "pc_round=", result.get("pc_round"),
+            "active=", result.get("active_guess"),
+            "hold=", result.get("hold"),
+            "queue=", result.get("queue"),
+        )
         scan_signature = self._make_scan_signature(result)
         same_scan = scan_signature == self.last_scan_signature
         self.last_scan_signature = scan_signature
 
+        setup_variants = []
+
         if not same_scan:
             self.draw_board(result["board"])
             setup_variants = self.build_setup_variants(result)
+
+            round_info = self.get_pc_round_info(result)
             round_text = ""
-            if result.get("pc_round") is not None:
-                round_text = f" ({result['pc_round']}회차"
-                if result.get("pieces_count") is not None:
-                    round_text += f" / {result['pieces_count']}p"
-                round_text += ")"
+
+            if round_info["pc_round"] is not None:
+                round_text = (
+                    f" ({round_info['pc_round']}회차"
+                    f" / {round_info['pc_progress']}/10p"
+                    f" / 총 {round_info['pieces_count']}p"
+                    f" / 가방 {round_info['bag_in_cycle']}"
+                    f")"
+                )
+
             if setup_variants:
                 self.render_setup_groups(setup_variants)
                 self.status_label.config(text=f"스캔 완료 - 추천 셋업 표시{round_text}")
-            else:
-                self.print_message("스캔 완료.\nHydra 계산을 누르면 해법 카드가 표시됩니다.")
-                self.status_label.config(text=f"스캔 완료{round_text}")
-                self.run_hydra_now(show_popup=False)
+                return
+
+            self.print_message("스캔 완료.\nHydra 계산을 누르면 해법 카드가 표시됩니다.")
+            self.status_label.config(text=f"스캔 완료{round_text}")
+
+            if self.hydra_auto_var.get():
+                if result.get("active_guess"):
+                    self.status_label.config(text=f"스캔 완료 - Hydra 계산 시작{round_text}")
+                    self.run_hydra_now(show_popup=False)
+                else:
+                    self.status_label.config(text="Hydra ACTIVE 대기 중")
+                    self.output_hint_var.set("ACTIVE 인식이 잡히면 Hydra 계산이 시작됩니다.")
         else:
             self.status_label.config(text="스캔 완료 (변화 없음)")
-
-        if self.hydra_auto_var.get() and not same_scan and setup_variants:
-            self.run_hydra_now(show_popup=False)
 
     def _on_scan_error(self, error_text, show_popup):
         self.status_label.config(text="스캔 실패")
@@ -956,7 +1329,7 @@ class TetrisScannerApp:
                     manual_see=manual_see,
                     bag_arg=bag_arg,
                     threads=4,
-                    timeout_sec=25,
+                    timeout_sec=60,
                 )
                 primary_result["active"] = active
                 primary_result["active_mode"] = "manual"
@@ -980,7 +1353,7 @@ class TetrisScannerApp:
                     manual_see="",
                     bag_arg=bag_arg,
                     threads=4,
-                    timeout_sec=25,
+                    timeout_sec=60,
                 )
                 primary_result["active"] = active_guess
                 primary_result["active_mode"] = "board_guess"
@@ -1003,7 +1376,7 @@ class TetrisScannerApp:
                     manual_see="",
                     bag_arg=bag_arg,
                     threads=4,
-                    timeout_sec=25,
+                    timeout_sec=60,
                 )
                 if result.get("active"):
                     primary_result = run_hydra_with_solution(
@@ -1014,7 +1387,7 @@ class TetrisScannerApp:
                         manual_see="",
                         bag_arg=bag_arg,
                         threads=4,
-                        timeout_sec=25,
+                        timeout_sec=60,
                     )
                     result["solution"] = primary_result.get("solution")
                     result["solution_variants"] = self._build_solution_variants(
@@ -1062,7 +1435,7 @@ class TetrisScannerApp:
                 manual_see="",
                 bag_arg=bag_arg,
                 threads=4,
-                timeout_sec=25,
+                timeout_sec=60,
             )
             alt_solution = alt_result.get("solution")
             alt_key = self._solution_key(alt_solution)

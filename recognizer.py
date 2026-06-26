@@ -513,23 +513,80 @@ def normalize_mixed_tetromino_components(board):
     return cleaned
 
 
-def guess_active_piece(board, max_rows=4):
+def guess_active_piece(board, max_rows=None):
     if not board:
         return None
 
-    search_rows = min(len(board), max_rows)
+    rows = len(board)
+    cols = len(board[0]) if rows else 0
 
-    for r in range(search_rows):
-        counts = {}
-        for cell in board[r]:
-            if cell not in VISIBLE_FIELD_PIECES:
+    # 아래 5칸은 이미 놓인 블럭/고스트가 많이 잡히는 영역으로 보고 active 후보에서 제외
+    active_search_bottom = max(0, rows - 5)
+
+    visited = [[False for _ in range(cols)] for _ in range(rows)]
+    candidates = []
+
+    for r in range(active_search_bottom):
+        for c in range(cols):
+            if visited[r][c]:
                 continue
-            counts[cell] = counts.get(cell, 0) + 1
 
-        if counts:
-            return max(counts.items(), key=lambda item: item[1])[0]
+            piece = board[r][c]
+            if piece not in VISIBLE_FIELD_PIECES:
+                continue
 
-    return None
+            stack = [(r, c)]
+            visited[r][c] = True
+            cells = []
+
+            while stack:
+                cr, cc = stack.pop()
+                cells.append((cr, cc))
+
+                for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nr = cr + dr
+                    nc = cc + dc
+
+                    if nr < 0 or nr >= active_search_bottom or nc < 0 or nc >= cols:
+                        continue
+                    if visited[nr][nc]:
+                        continue
+                    if board[nr][nc] != piece:
+                        continue
+
+                    visited[nr][nc] = True
+                    stack.append((nr, nc))
+
+            count = len(cells)
+            if 1 <= count <= 4:
+                min_r = min(x[0] for x in cells)
+                max_r = max(x[0] for x in cells)
+                avg_r = sum(x[0] for x in cells) / count
+
+                candidates.append(
+                    {
+                        "piece": piece,
+                        "count": count,
+                        "min_r": min_r,
+                        "max_r": max_r,
+                        "avg_r": avg_r,
+                    }
+                )
+
+    if not candidates:
+        return None
+
+    # 4칸짜리 온전한 미노를 우선, 그다음 위쪽에 있는 후보 우선
+    candidates.sort(
+        key=lambda item: (
+            item["count"] == 4,
+            -item["count"],
+            -item["min_r"],
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]["piece"]
 
 def find_piece_components(board, target_piece):
     """
@@ -927,11 +984,14 @@ def infer_pieces_counter_region(config):
         return region
 
     field = get_normalized_field_region(config["field"])
+
+    # TETR.IO 좌측 통계에서 INPUTS가 아니라 PIECIES 숫자 라인을 잡는다.
+    # 기존 y=0.56 부근은 INPUTS 라인에 가까워서 0을 읽는 경우가 있음.
     return {
-        "x": int(round(field["x"] - field["w"] * 0.40)),
-        "y": int(round(field["y"] + field["h"] * 0.56)),
-        "w": int(round(field["w"] * 0.34)),
-        "h": int(round(field["h"] * 0.18)),
+        "x": int(round(field["x"] - field["w"] * 0.33)),
+        "y": int(round(field["y"] + field["h"] * 0.61)),
+        "w": int(round(field["w"] * 0.18)),
+        "h": int(round(field["h"] * 0.12)),
     }
 
 
@@ -964,7 +1024,7 @@ def recognize_pieces_count(img, config):
         return None
 
     recog = config.get("recognition", {})
-    top_ratio = recog.get("pieces_counter_top_ratio", 0.66)
+    top_ratio = recog.get("pieces_counter_top_ratio", 1.0)
     threshold = recog.get("pieces_counter_threshold", 170)
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)

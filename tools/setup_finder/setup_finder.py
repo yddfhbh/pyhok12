@@ -6,7 +6,6 @@ from pathlib import Path
 VALID_PIECES = set("IJLOSTZ")
 
 # Setup Konbini 쪽 정렬 기준.
-# Hydra의 IJLOSTZ랑 다르니까 섞으면 안 됨.
 KJ_SORT_ORDER = "TILJSZO"
 
 _DATA_CACHE = None
@@ -59,48 +58,92 @@ def load_setup_data():
     return _DATA_CACHE
 
 
-def find_7th(queue):
-    q = normalize_queue(queue)
+def make_result(ok, pc, queue, setup_id="", message="", row=None):
+    result = None
 
-    if len(q) < 3:
-        return {
-            "ok": False,
-            "pc": 7,
-            "queue": q,
-            "message": "7th PC는 최소 3개 큐가 필요합니다.",
-            "result": None,
-        }
-
-    setup_id = kjsort(q[:3])
-    data = load_setup_data()
-
-    rows = data.get("seventh", [])
-    by_id = {row.get("id"): row for row in rows}
-
-    row = by_id.get(setup_id)
-    if not row:
-        return {
-            "ok": False,
-            "pc": 7,
-            "queue": q,
-            "id": setup_id,
-            "message": f"7th PC 결과 없음: {setup_id}",
-            "result": None,
-        }
-
-    return {
-        "ok": True,
-        "pc": 7,
-        "queue": q,
-        "id": setup_id,
-        "message": "7th PC 결과 찾음",
-        "result": {
+    if row:
+        result = {
             "id": row.get("id", ""),
             "sol": row.get("sol", ""),
             "fumen": row.get("fumen", ""),
             "imgur": imgur_url(row.get("imgur", "")),
-        },
+        }
+
+    return {
+        "ok": ok,
+        "pc": pc,
+        "queue": queue,
+        "id": setup_id,
+        "message": message,
+        "result": result,
     }
+
+
+def find_by_data_key(queue, pc, data_key, take_count):
+    q = normalize_queue(queue)
+
+    if len(q) < take_count:
+        return make_result(
+            False,
+            pc,
+            q,
+            message=f"{pc}회차 PC는 최소 {take_count}개 큐가 필요합니다.",
+        )
+
+    setup_id = kjsort(q[:take_count])
+    data = load_setup_data()
+
+    rows = data.get(data_key, [])
+    by_id = {row.get("id"): row for row in rows}
+
+    row = by_id.get(setup_id)
+    if not row:
+        return make_result(
+            False,
+            pc,
+            q,
+            setup_id=setup_id,
+            message=f"{pc}회차 PC 결과 없음: {setup_id}",
+        )
+
+    return make_result(
+        True,
+        pc,
+        q,
+        setup_id=setup_id,
+        message=f"{pc}회차 PC 결과 찾음",
+        row=row,
+    )
+
+
+def find_1st(queue):
+    # 1st PC는 우선 앞 5개 기준으로 연결.
+    # 만약 결과가 너무 안 나오면 6개 기준으로 바꿔야 함.
+    return find_by_data_key(queue, pc=1, data_key="first", take_count=6)
+
+
+def find_7th(queue):
+    return find_by_data_key(queue, pc=7, data_key="seventh", take_count=3)
+
+
+def find_setup_for_pc(queue, pc_round):
+    try:
+        pc_round = int(pc_round)
+    except (TypeError, ValueError):
+        return make_result(False, None, normalize_queue(queue), message="PC 회차 인식 실패")
+
+    if pc_round == 1:
+        return find_1st(queue)
+
+    if pc_round == 7:
+        return find_7th(queue)
+
+    return make_result(
+        False,
+        pc_round,
+        normalize_queue(queue),
+        message=f"{pc_round}회차 PC 데이터는 아직 연결되지 않았습니다.",
+    )
 
 
 def find_setups(queue):
@@ -108,6 +151,7 @@ def find_setups(queue):
 
     return {
         "queue": q,
+        "first": find_1st(q),
         "seventh": find_7th(q),
     }
 
@@ -115,27 +159,35 @@ def find_setups(queue):
 def format_setup_summary(queue):
     result = find_setups(queue)
     q = result["queue"]
+    first = result["first"]
     seventh = result["seventh"]
 
     lines = []
     lines.append(f"SETUP FINDER: queue={q or '-'}")
 
-    if seventh["ok"]:
-        item = seventh["result"]
-        lines.append(f"7th PC: {seventh['id']} / SOL={item['sol']}")
-        if item["imgur"]:
-            lines.append(f"IMG: {item['imgur']}")
-        if item["fumen"]:
-            lines.append(f"FUMEN: {item['fumen']}")
-    else:
-        lines.append(f"7th PC: {seventh['message']}")
+    for label, item in (("1st PC", first), ("7th PC", seventh)):
+        if item["ok"]:
+            setup = item["result"]
+            lines.append(f"{label}: {item['id']} / SOL={setup['sol']}")
+            if setup["imgur"]:
+                lines.append(f"IMG: {setup['imgur']}")
+            if setup["fumen"]:
+                lines.append(f"FUMEN: {setup['fumen']}")
+        else:
+            lines.append(f"{label}: {item['message']}")
 
     return "\n".join(lines)
 
 
 def main():
-    queue = sys.argv[1] if len(sys.argv) >= 2 else "ztsoitlj"
+    queue = sys.argv[1] if len(sys.argv) >= 2 else "ijtzo"
+    pc = int(sys.argv[2]) if len(sys.argv) >= 3 else 1
+
     print(format_setup_summary(queue))
+    print()
+    print(f"SELECTED {pc}회차:")
+    selected = find_setup_for_pc(queue, pc)
+    print(json.dumps(selected, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

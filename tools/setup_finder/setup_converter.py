@@ -9,7 +9,7 @@ def clean_text(value):
     return str(value).strip()
 
 
-def convert_7th_data(workbook_path):
+def load_workbook(workbook_path):
     try:
         import openpyxl
     except ImportError as exc:
@@ -17,15 +17,25 @@ def convert_7th_data(workbook_path):
             "openpyxl이 필요합니다. 터미널에서 `py -m pip install openpyxl` 실행 후 다시 시도하세요."
         ) from exc
 
-    wb = openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
+    return openpyxl.load_workbook(workbook_path, read_only=True, data_only=False)
 
-    if "7th Data" not in wb.sheetnames:
-        raise RuntimeError("엑셀에 '7th Data' 시트가 없습니다.")
 
-    ws = wb["7th Data"]
+def get_sheet(wb, names):
+    for name in names:
+        if name in wb.sheetnames:
+            return wb[name]
 
+    raise RuntimeError(
+        "엑셀에 필요한 시트가 없습니다.\n"
+        f"찾은 시트: {', '.join(wb.sheetnames)}\n"
+        f"필요한 후보: {', '.join(names)}"
+    )
+
+
+def convert_basic_data_sheet(ws, pc_name):
     rows = []
-    # 7th Data 기준:
+
+    # 기본 Data 시트 기준:
     # B열 ID, C열 SOL, D열 FUMEN, E열 Imgur
     for row in ws.iter_rows(min_row=3, values_only=True):
         setup_id = clean_text(row[1] if len(row) > 1 else "")
@@ -42,6 +52,7 @@ def convert_7th_data(workbook_path):
                 "sol": sol,
                 "fumen": fumen,
                 "imgur": imgur,
+                "pc": pc_name,
             }
         )
 
@@ -59,10 +70,16 @@ def main():
     if not workbook_path.exists():
         raise RuntimeError(f"엑셀 파일을 찾지 못했습니다: {workbook_path}")
 
+    wb = load_workbook(workbook_path)
+
+    first_ws = get_sheet(wb, ["1st: Data", "1st Data", "1st:Data"])
+    seventh_ws = get_sheet(wb, ["7th: Data", "7th Data", "7th:Data"])
+
     data = {
-        "version": 1,
+        "version": 2,
         "source": workbook_path.name,
-        "seventh": convert_7th_data(workbook_path),
+        "first": convert_basic_data_sheet(first_ws, "first"),
+        "seventh": convert_basic_data_sheet(seventh_ws, "seventh"),
     }
 
     out_path = Path(__file__).resolve().parent / "setup_data.json"
@@ -72,6 +89,7 @@ def main():
     )
 
     print(f"완료: {out_path}")
+    print(f"1st Data rows: {len(data['first'])}")
     print(f"7th Data rows: {len(data['seventh'])}")
 
 
