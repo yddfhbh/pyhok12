@@ -58,8 +58,9 @@ class NormalizedSnapshot:
     current: str
     hold: str | None
     queue: list
-    piece_counter: int
+    piece_counter: int | None
     piece_counter_source: str
+    state_revision: int
     game_id: str | None
     round_id: str | None
     token: str
@@ -202,16 +203,28 @@ def normalize_snapshot_payload(
             f"queue 길이가 부족합니다. required={required_queue_length} actual={len(queue)}"
         )
 
-    piece_counter = payload.get("pieceCounter")
-    try:
-        piece_counter = int(piece_counter)
-    except (TypeError, ValueError) as exc:
-        raise SnapshotValidationError("pieceCounter가 유효한 정수가 아닙니다.") from exc
-    if piece_counter < 0:
-        raise SnapshotValidationError("pieceCounter가 음수입니다.")
     piece_counter_source = str(payload.get("pieceCounterSource") or "").strip()
     if not piece_counter_source:
         raise SnapshotValidationError("pieceCounterSource가 비어 있습니다.")
+    state_revision = payload.get("stateRevision")
+    if state_revision is None:
+        state_revision = payload.get("pieceCounter")
+    try:
+        state_revision = int(state_revision)
+    except (TypeError, ValueError) as exc:
+        raise SnapshotValidationError("stateRevision이 유효한 정수가 아닙니다.") from exc
+    if state_revision < 0:
+        raise SnapshotValidationError("stateRevision이 음수입니다.")
+
+    piece_counter_raw = payload.get("pieceCounter")
+    piece_counter = None
+    if piece_counter_source != "derived-revision" or piece_counter_raw is not None:
+        try:
+            piece_counter = int(piece_counter_raw)
+        except (TypeError, ValueError) as exc:
+            raise SnapshotValidationError("pieceCounter가 유효한 정수가 아닙니다.") from exc
+        if piece_counter < 0:
+            raise SnapshotValidationError("pieceCounter가 음수입니다.")
 
     game_id = str(payload.get("gameId")).strip() if payload.get("gameId") is not None else None
     round_id = str(payload.get("roundId")).strip() if payload.get("roundId") is not None else None
@@ -219,7 +232,7 @@ def normalize_snapshot_payload(
     if not session_id:
         raise SnapshotValidationError("sessionId가 비어 있습니다.")
 
-    token = str(payload.get("token") or f"{session_id}:{piece_counter}").strip()
+    token = str(payload.get("token") or f"{session_id}:{state_revision}").strip()
     if not token:
         raise SnapshotValidationError("snapshot token이 비어 있습니다.")
 
@@ -236,6 +249,7 @@ def normalize_snapshot_payload(
         queue=queue,
         piece_counter=piece_counter,
         piece_counter_source=piece_counter_source,
+        state_revision=state_revision,
         game_id=game_id,
         round_id=round_id,
         token=token,
@@ -433,16 +447,16 @@ class TetrioStateSource:
 
             if (
                 self._last_piece_counter is not None
-                and snapshot.piece_counter < self._last_piece_counter
+                and snapshot.state_revision < self._last_piece_counter
             ):
-                self.last_reason = "같은 세션에서 pieceCounter가 감소했습니다."
+                self.last_reason = "같은 세션에서 stateRevision이 감소했습니다."
                 self._remember_error(self.last_reason)
                 self.last_valid_snapshot = None
                 return None
 
             self.last_valid_snapshot = snapshot
             self._last_game_key = snapshot.round_id or snapshot.game_id
-            self._last_piece_counter = snapshot.piece_counter
+            self._last_piece_counter = snapshot.state_revision
             self._last_piece_counter_source = snapshot.piece_counter_source
             self._last_captured_at = snapshot.captured_at
             self._last_token = snapshot.token
@@ -502,6 +516,8 @@ class TetrioStateSource:
             str(self._resolve_runtime_path(cdp_config["snapshot_path"])),
             "--vs-object-snapshot-path",
             str(self._resolve_runtime_path(cdp_config["vs_object_snapshot_path"])),
+            "--bridge-path",
+            str(self._resolve_runtime_path(cdp_config["vs_bridge_path"])),
             "--port",
             str(cdp_config["port"]),
             "--url",

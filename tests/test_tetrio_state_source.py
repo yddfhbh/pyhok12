@@ -35,6 +35,7 @@ def make_payload(**overrides):
         "queue": ["L", "S", "O", "Z", "J"],
         "pieceCounter": 15,
         "pieceCounterSource": "stats.piecesPlaced",
+        "stateRevision": 15,
         "gameId": "solo-1",
         "roundId": None,
         "sessionId": "session-1",
@@ -44,6 +45,8 @@ def make_payload(**overrides):
         "capturedAt": now_ms,
     }
     payload.update(overrides)
+    if "stateRevision" not in overrides:
+        payload["stateRevision"] = payload["pieceCounter"]
     return payload
 
 
@@ -215,6 +218,20 @@ class SnapshotNormalizationTests(unittest.TestCase):
                 required_queue_length=5,
             )
 
+    def test_allows_missing_piece_counter_for_derived_revision(self):
+        snapshot = normalize_snapshot_payload(
+            make_payload(
+                pieceCounter=None,
+                pieceCounterSource="derived-revision",
+                stateRevision=7,
+                token="session-1:7",
+            ),
+            required_queue_length=5,
+        )
+
+        self.assertIsNone(snapshot.piece_counter)
+        self.assertEqual(snapshot.state_revision, 7)
+
 
 class TetrioStateSourceTests(unittest.TestCase):
     def test_rejects_piece_counter_regression_in_same_session(self):
@@ -239,7 +256,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             )
             write_snapshot(snapshot_path, second)
             self.assertIsNone(source.get_latest_valid_snapshot())
-            self.assertIn("pieceCounter", source.last_reason)
+            self.assertIn("stateRevision", source.last_reason)
 
     def test_allows_new_session_after_tombstone_even_with_same_game_id(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -310,6 +327,31 @@ class TetrioStateSourceTests(unittest.TestCase):
             snapshot = source.get_latest_valid_snapshot()
             self.assertIsNotNone(snapshot)
             self.assertEqual(snapshot.session_id, "session-2")
+
+    def test_derived_revision_monotonicity_is_checked_per_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+
+            first = make_payload(
+                pieceCounter=None,
+                pieceCounterSource="derived-revision",
+                stateRevision=3,
+                token="session-1:3",
+            )
+            write_snapshot(snapshot_path, first)
+            self.assertIsNotNone(source.get_latest_valid_snapshot())
+
+            second = make_payload(
+                pieceCounter=None,
+                pieceCounterSource="derived-revision",
+                stateRevision=2,
+                token="session-1:2",
+                capturedAt=first["capturedAt"] + 20,
+            )
+            write_snapshot(snapshot_path, second)
+            self.assertIsNone(source.get_latest_valid_snapshot())
+            self.assertIn("stateRevision", source.last_reason)
 
     def test_get_status_does_not_raise_when_restart_is_rate_limited(self):
         with tempfile.TemporaryDirectory() as tmpdir:

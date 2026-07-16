@@ -10,6 +10,7 @@ import {
   shutdownChromium,
   waitForCdpReady
 } from "./chromium-launch.mjs";
+import { DEFAULT_BRIDGE_PATH } from "./vs-ws-bridge.mjs";
 
 const DEFAULT_NEXT_COUNT = 6;
 const DEFAULT_STATUS_MS = 2500;
@@ -136,6 +137,110 @@ export function buildIdentityToken(identity, pieceCounter) {
   return `${identity}:${pieceCounter}`;
 }
 
+export function normalizeSoloPieceValue(value, depth = 0) {
+  if (depth > 3 || value === null || value === undefined || value === false) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return VS_PIECE_NAMES[Math.floor(value)]?.toUpperCase() ?? null;
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) {
+      return null;
+    }
+    const upper = text.toUpperCase();
+    const prefixedMatch = upper.match(/^TETROMINO_([IJLOSTZ])$/);
+    if (prefixedMatch?.[1]) {
+      return prefixedMatch[1].toUpperCase();
+    }
+    if (VS_PIECE_NAMES.includes(upper.toLowerCase())) {
+      return upper;
+    }
+    const tokens = upper.split(/[^A-Z0-9]+/).filter(Boolean);
+    for (const token of tokens) {
+      if (VS_PIECE_NAMES.includes(token.toLowerCase())) {
+        return token;
+      }
+    }
+    return null;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const piece = normalizeSoloPieceValue(item, depth + 1);
+      if (piece) {
+        return piece;
+      }
+    }
+    return null;
+  }
+  if (typeof value === "object") {
+    for (const key of [
+      "type",
+      "id",
+      "name",
+      "symbol",
+      "kind",
+      "shape",
+      "piece",
+      "current",
+      "active",
+      "falling"
+    ]) {
+      const piece = normalizeSoloPieceValue(value[key], depth + 1);
+      if (piece) {
+        return piece;
+      }
+    }
+  }
+  return null;
+}
+
+export function buildBoardSignature(board) {
+  if (!Array.isArray(board)) {
+    return "";
+  }
+  return board
+    .map((row) => (Array.isArray(row) ? row.map((cell) => (cell ? "1" : "0")).join("") : ""))
+    .join("|");
+}
+
+export function buildSoloSpawnSignature(state) {
+  return [
+    buildBoardSignature(state?.field ?? []),
+    normalizeSoloPieceValue(state?.current) ?? "",
+    normalizeSoloPieceValue(state?.hold) ?? "",
+    Array.isArray(state?.queue) ? state.queue.map((piece) => normalizeSoloPieceValue(piece) ?? "").join(",") : ""
+  ].join("|");
+}
+
+export function selectSoloPieceCounterCandidate({
+  state = null,
+  boardState = null,
+  gameState = null
+} = {}) {
+  const integerCounter = (value) =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+  const sources = [
+    ["state.pieceCounter", state?.pieceCounter],
+    ["state.piecesPlaced", state?.piecesPlaced],
+    ["state.piecesplaced", state?.piecesplaced],
+    ["state.piececount", state?.piececount],
+    ["state.stats.piecesPlaced", state?.stats?.piecesPlaced],
+    ["state.stats.pieces", state?.stats?.pieces],
+    ["boardState.pieceCounter", boardState?.pieceCounter],
+    ["gameState.stats.piecesPlaced", gameState?.stats?.piecesPlaced],
+    ["gameState.stats.pieces", gameState?.stats?.pieces]
+  ];
+  for (const [source, value] of sources) {
+    const normalized = integerCounter(value);
+    if (normalized !== null) {
+      return { value: normalized, source };
+    }
+  }
+  return { value: null, source: "derived-revision" };
+}
+
 export function createSessionState() {
   return {
     sessionSerial: 0,
@@ -145,7 +250,9 @@ export function createSessionState() {
     lastGameId: "",
     lastGameObjectId: "",
     lastPieceCounterSource: "",
-    seenGameSinceReset: false
+    seenGameSinceReset: false,
+    lastStateRevision: -1,
+    lastDerivedSpawnSignature: ""
   };
 }
 
@@ -157,6 +264,8 @@ export function resetSessionState(sessionState) {
   sessionState.lastGameObjectId = "";
   sessionState.lastPieceCounterSource = "";
   sessionState.seenGameSinceReset = false;
+  sessionState.lastStateRevision = -1;
+  sessionState.lastDerivedSpawnSignature = "";
   return sessionState;
 }
 
@@ -214,6 +323,34 @@ export function acceptPieceCounterSource(sessionState, source) {
   return sessionState.lastPieceCounterSource === normalizedSource;
 }
 
+export function resolveSoloStateRevision(sessionState, state) {
+  const numericCounter =
+    Number.isInteger(state?.pieceCounter) && state.pieceCounter >= 0
+      ? state.pieceCounter
+      : null;
+  if (numericCounter !== null && state?.pieceCounterSource !== "derived-revision") {
+    sessionState.lastStateRevision = numericCounter;
+    return numericCounter;
+  }
+
+  const spawnSignature = buildSoloSpawnSignature(state);
+  if (!spawnSignature) {
+    const fallbackRevision = Math.max(0, sessionState.lastStateRevision);
+    sessionState.lastStateRevision = fallbackRevision;
+    return fallbackRevision;
+  }
+  if (!sessionState.lastDerivedSpawnSignature) {
+    sessionState.lastDerivedSpawnSignature = spawnSignature;
+    sessionState.lastStateRevision = Math.max(0, sessionState.lastStateRevision + 1);
+    return sessionState.lastStateRevision;
+  }
+  if (sessionState.lastDerivedSpawnSignature !== spawnSignature) {
+    sessionState.lastDerivedSpawnSignature = spawnSignature;
+    sessionState.lastStateRevision += 1;
+  }
+  return Math.max(0, sessionState.lastStateRevision);
+}
+
 export function buildTombstoneSnapshot({
   source = "browser_cdp",
   mode = "Unknown",
@@ -236,6 +373,7 @@ export function buildTombstoneSnapshot({
     queue: [],
     pieceCounter: null,
     pieceCounterSource: null,
+    stateRevision: null,
     token: null,
     capturedAt
   };
@@ -396,11 +534,24 @@ function isFatalCdpError(error) {
   );
 }
 
+function logPathDebug(label, targetPath) {
+  const resolvedPath = String(targetPath ?? "");
+  const directory = resolvedPath ? path.dirname(resolvedPath) : "";
+  console.log(`[browser-path] ${label}=${resolvedPath}`);
+  console.log(`[browser-path] ${label}.json=${JSON.stringify(resolvedPath)}`);
+  if (directory) {
+    console.log(`[browser-path] ${label}.dirExists=${existsSync(directory)}`);
+    console.log(`[browser-path] ${label}.dir=${directory}`);
+    console.log(`[browser-path] ${label}.dir.json=${JSON.stringify(directory)}`);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
   const vsObjectSnapshotPath =
     args.vsObjectSnapshotPath ?? DEFAULT_VS_OBJECT_SNAPSHOT_PATH;
+  const bridgePath = args.bridgePath ?? DEFAULT_BRIDGE_PATH;
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
@@ -417,6 +568,11 @@ async function main() {
   const browserPerfEnabled = process.env.FUSION_BROWSER_PERF === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
+
+  logPathDebug("cwd", process.cwd());
+  logPathDebug("snapshotPath", snapshotPath);
+  logPathDebug("vsObjectSnapshotPath", vsObjectSnapshotPath);
+  logPathDebug("bridgePath", bridgePath);
 
   let browserProcess = null;
   let ownsChromium = false;
@@ -721,7 +877,8 @@ async function main() {
       lastReason = "";
       lastReasonAt = 0;
 
-      const pieceKey = `${sessionId}:${state.pieceCounter}`;
+      const stateRevision = resolveSoloStateRevision(sessionState, state);
+      const pieceKey = `${sessionId}:${stateRevision}`;
       if (pieceKey !== snapshotTracking.pendingPieceKey) {
         snapshotTracking.pendingPieceKey = pieceKey;
         snapshotTracking.pendingPieceDetectedAt = Date.now();
@@ -757,9 +914,10 @@ async function main() {
         b2b: Boolean(state.b2b),
         combo: state.combo,
         incoming: state.incoming,
-        pieceCounter: state.pieceCounter,
+        pieceCounter: Number.isInteger(state.pieceCounter) ? state.pieceCounter : null,
         pieceCounterSource: state.pieceCounterSource,
-        token: buildIdentityToken(sessionId, state.pieceCounter),
+        stateRevision,
+        token: buildIdentityToken(sessionId, stateRevision),
         countdown: state.countdown,
         capturedAt: Date.now(),
         activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
@@ -784,7 +942,7 @@ async function main() {
         if (snapshot.token !== snapshotTracking.lastLoggedToken) {
           snapshotTracking.lastLoggedToken = snapshot.token;
           console.log(
-            `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
+            `[browser] page state ready pieceCounter=${snapshot.pieceCounter ?? "null"} stateRevision=${stateRevision} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
           );
         }
       }
@@ -834,6 +992,7 @@ async function markCurrentGameAsEnded(cdp) {
 
       delete window.__fusionTetrioGame;
       delete window.__fusionTetrioBridge;
+      delete window.__fusionSoloRootCandidate;
       delete window.__fusionVsObjectCache;
 
       return true;
@@ -1225,6 +1384,7 @@ function buildVsObjectSnapshot(candidate, vsRoundStatus, source, sessionId) {
       : [],
     pieceCounter,
     pieceCounterSource: String(candidate?.pieceCounterSource ?? source ?? "vs_object"),
+    stateRevision: pieceCounter,
     token: buildIdentityToken(sessionId || roundId || gameId || "vs", pieceCounter),
     active: Boolean(candidate?.active),
     capturedAt: candidate?.capturedAt ?? Date.now(),
@@ -2706,6 +2866,15 @@ function logVsObjectCandidate(candidate, log = (message) => console.log(message)
 }
 
 export async function readTetrioState(cdp, options) {
+  const flushProbeLogs = (state) => {
+    if (!state || !Array.isArray(state.probeLogs)) {
+      return state;
+    }
+    for (const line of state.probeLogs) {
+      console.log(line);
+    }
+    return state;
+  };
   const read = async () => {
     const raw = await safeRuntimeEvaluate(cdp, {
       expression: tetrioStateExpression(),
@@ -2720,7 +2889,7 @@ export async function readTetrioState(cdp, options) {
         }
       }
     });
-    return raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" };
+    return flushProbeLogs(raw.result?.value ?? { ok: false, ready: false, reason: "page probe returned empty" });
   };
 
   let state = await read();
@@ -2880,27 +3049,9 @@ export function pausedFrameExposureExpression() {
       if (
         typeof Ai !== "undefined" &&
         Ai &&
-        typeof Ai.ejectState === "function" &&
-        typeof Ai.ejectBoardState === "function"
+        (typeof Ai === "object" || typeof Ai === "function")
       ) {
-        if (Ai === window.__fusionEndedTetrioGame) {
-          try {
-            const exported = Ai.ejectState();
-            const state =
-              exported && typeof exported === "object" && exported.game
-                ? exported.game
-                : exported;
-            if (state?.destroyed || state?.dead || state?.gameover) {
-              return { ok: false };
-            }
-          } catch {
-            return { ok: false };
-          }
-
-          delete window.__fusionEndedTetrioGame;
-        }
-
-        window.__fusionTetrioGame = Ai;
+        window.__fusionSoloRootCandidate = Ai;
         window.__fusionTetrioBridge = {
           ok: true,
           source: "closure:Ai",
@@ -2932,6 +3083,7 @@ function buildSeedFallbackState(network) {
     incoming: 0,
     pieceCounter: 0,
     pieceCounterSource: "seed_fallback",
+    stateRevision: 0,
     gameId: network.seed ? `seed:${network.seed}` : "seed_fallback",
     gameObjectId: "seed_fallback",
     playing: ready,
@@ -3492,27 +3644,163 @@ export function vsObjectStateExpression(identity) {
 export function tetrioStateExpression() {
   return `(() => {
     const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
-    const normalizePiece = (value) => {
-      if (value === null || value === undefined || value === false) return null;
-      if (typeof value === "number") return pieceNames[value] ?? null;
+    const logs = [];
+    const ensureProbeState = () => {
+      if (!window.__fusionSoloProbeState || typeof window.__fusionSoloProbeState !== "object") {
+        window.__fusionSoloProbeState = {
+          loggedKeys: new Set(),
+          objectIds: new WeakMap(),
+          nextObjectId: 1
+        };
+      }
+      if (!(window.__fusionSoloProbeState.loggedKeys instanceof Set)) {
+        window.__fusionSoloProbeState.loggedKeys = new Set();
+      }
+      if (!(window.__fusionSoloProbeState.objectIds instanceof WeakMap)) {
+        window.__fusionSoloProbeState.objectIds = new WeakMap();
+      }
+      return window.__fusionSoloProbeState;
+    };
+    const probeState = ensureProbeState();
+    const isObjectLike = (value) =>
+      (typeof value === "object" && value !== null) || typeof value === "function";
+    const isDomLike = (value) =>
+      !!value &&
+      typeof value === "object" &&
+      (typeof value.nodeType === "number" || typeof value.ownerDocument === "object");
+    const isTypedArray = (value) =>
+      typeof ArrayBuffer !== "undefined" &&
+      typeof ArrayBuffer.isView === "function" &&
+      ArrayBuffer.isView(value);
+    const isSkippable = (value) =>
+      !isObjectLike(value) ||
+      isDomLike(value) ||
+      isTypedArray(value) ||
+      value instanceof Date ||
+      value instanceof RegExp ||
+      value === window ||
+      (typeof document !== "undefined" && value === document);
+    const getObjectId = (value) => {
+      if (!isObjectLike(value)) return "primitive";
+      let objectId = probeState.objectIds.get(value);
+      if (!objectId) {
+        objectId = "solo-" + String(probeState.nextObjectId++);
+        probeState.objectIds.set(value, objectId);
+      }
+      return objectId;
+    };
+    const logOnce = (key, lineList) => {
+      if (probeState.loggedKeys.has(key)) {
+        return;
+      }
+      probeState.loggedKeys.add(key);
+      for (const line of lineList) {
+        if (line) {
+          logs.push(line);
+        }
+      }
+    };
+    const descriptorEntries = (value) => {
+      try {
+        return Object.entries(Object.getOwnPropertyDescriptors(value));
+      } catch {
+        return [];
+      }
+    };
+    const safeOwnKeys = (value, limit = 60) => {
+      try {
+        return Object.getOwnPropertyNames(value).slice(0, limit);
+      } catch {
+        return [];
+      }
+    };
+    const safeProto = (value) => {
+      try {
+        return Object.getPrototypeOf(value);
+      } catch {
+        return null;
+      }
+    };
+    const ownValue = (value, keys) => {
+      if (!isObjectLike(value)) return undefined;
+      for (const key of keys) {
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+            return descriptor.value;
+          }
+        } catch {}
+      }
+      return undefined;
+    };
+    const ownValueEntries = (value, pathLabel, limit = 60) => {
+      if (!isObjectLike(value)) return [];
+      if (Array.isArray(value)) {
+        return value.slice(0, limit).map((child, index) => ({
+          key: String(index),
+          value: child,
+          path: pathLabel + "[" + String(index) + "]"
+        }));
+      }
+      const entries = [];
+      for (const [key, descriptor] of descriptorEntries(value)) {
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+          continue;
+        }
+        if (key === "length") {
+          continue;
+        }
+        entries.push({
+          key,
+          value: descriptor.value,
+          path:
+            /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)
+              ? pathLabel + "." + key
+              : pathLabel + "[" + JSON.stringify(key) + "]"
+        });
+        if (entries.length >= limit) {
+          break;
+        }
+      }
+      return entries;
+    };
+    const normalizePiece = (value, depth = 0) => {
+      if (depth > 3 || value === null || value === undefined || value === false) return null;
+      if (typeof value === "number" && Number.isFinite(value)) return pieceNames[Math.floor(value)] ?? null;
       if (typeof value === "string") {
         const text = value.trim().toLowerCase();
         if (!text) return null;
+        const prefixedMatch = text.match(/^tetromino_([ijlostz])$/);
+        if (prefixedMatch?.[1]) return prefixedMatch[1].toLowerCase();
+        if (pieceNames.includes(text)) return text;
         for (const token of text.split(/[^a-z0-9]+/)) {
           if (pieceNames.includes(token)) return token;
         }
-        return pieceNames.includes(text) ? text : null;
+        return null;
       }
       if (Array.isArray(value)) {
         for (const item of value) {
-          const piece = normalizePiece(item);
+          const piece = normalizePiece(item, depth + 1);
           if (piece) return piece;
         }
         return null;
       }
       if (typeof value === "object") {
-        for (const key of ["type", "symbol", "id", "piece", "name", "mino", "value"]) {
-          const piece = normalizePiece(value[key]);
+        for (const key of [
+          "type",
+          "id",
+          "name",
+          "symbol",
+          "kind",
+          "shape",
+          "piece",
+          "current",
+          "active",
+          "falling",
+          "mino",
+          "value"
+        ]) {
+          const piece = normalizePiece(ownValue(value, [key]), depth + 1);
           if (piece) return piece;
         }
       }
@@ -3525,27 +3813,66 @@ export function tetrioStateExpression() {
         return text !== "" && text !== "." && text !== "0" && text !== "empty";
       }
       if (typeof cell === "object") {
-        if ("empty" in cell) return !cell.empty;
-        if ("type" in cell) return filled(cell.type);
-        if ("mino" in cell) return filled(cell.mino);
+        const empty = ownValue(cell, ["empty"]);
+        if (typeof empty === "boolean") return !empty;
+        const type = ownValue(cell, ["type", "mino", "value", "id", "cell"]);
+        if (type !== undefined) return filled(type);
       }
       return true;
     };
-    const rowCells = (row) =>
-      Array.isArray(row)
-        ? row
-        : Array.isArray(row?.cells)
-          ? row.cells
-          : Array.isArray(row?.row)
-            ? row.row
-            : null;
-    const queueFrom = (...values) => {
-      for (const value of values) {
-        if (!Array.isArray(value)) continue;
-        const queue = value.map(normalizePiece).filter(Boolean);
-        if (queue.length > 0) return queue.slice(0, 12);
+    const rowCells = (row) => {
+      if (Array.isArray(row)) return row;
+      if (!row || typeof row !== "object") return null;
+      const direct = ownValue(row, ["cells", "row", "data", "cols", "entries"]);
+      return Array.isArray(direct) ? direct : null;
+    };
+    const boardFromMatrix = (value) => {
+      if (Array.isArray(value)) {
+        if ((value.length === 20 || value.length === 40) && value.every((row) => {
+          const cells = rowCells(row);
+          return Array.isArray(cells) && cells.length === 10;
+        })) {
+          return value.map((row) => rowCells(row).slice(0, 10).map(filled));
+        }
       }
-      return [];
+      if (value && typeof value === "object") {
+        for (const key of ["board", "field", "rows", "grid", "matrix", "cells", "entries", "b"]) {
+          const nested = ownValue(value, [key]);
+          if (nested !== undefined) {
+            const board = boardFromMatrix(nested);
+            if (board) return board;
+          }
+        }
+      }
+      return null;
+    };
+    const queueFromValue = (value) => {
+      if (!Array.isArray(value)) return [];
+      return value.map((item) => normalizePiece(item)).filter(Boolean).slice(0, 14);
+    };
+    const pickQueue = (sources) => {
+      for (const [basePath, source] of sources) {
+        for (const key of ["bag", "queue", "next", "preview", "previews", "pieces", "nextQueue"]) {
+          const value = ownValue(source, [key]);
+          const queue = queueFromValue(value);
+          if (queue.length > 0) {
+            return { queue, path: basePath + "." + key };
+          }
+        }
+      }
+      return { queue: [], path: "" };
+    };
+    const pickPiece = (sources, keys) => {
+      for (const [basePath, source] of sources) {
+        for (const key of keys) {
+          const value = ownValue(source, [key]);
+          const piece = normalizePiece(value);
+          if (piece) {
+            return { piece, value, path: basePath + "." + key };
+          }
+        }
+      }
+      return { piece: null, value: null, path: "" };
     };
     const numberFrom = (...values) => {
       for (const value of values) {
@@ -3560,112 +3887,263 @@ export function tetrioStateExpression() {
     };
     const integerCounter = (value) =>
       typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-    const selectPieceCounter = (state, stats) => {
-      const candidates = [
-        ["pieceCounter", state?.pieceCounter],
-        ["piecesPlaced", state?.piecesPlaced],
-        ["piecesplaced", state?.piecesplaced],
-        ["piececount", state?.piececount],
-        ["stats.piecesPlaced", stats?.piecesPlaced],
-        ["stats.pieces", stats?.pieces],
-        ["pieces", state?.pieces]
-      ];
-      for (const [source, value] of candidates) {
-        const normalized = integerCounter(value);
-        if (normalized !== null) {
-          return { value: normalized, source };
+    const selectPieceCounter = (sources) => {
+      for (const [basePath, source] of sources) {
+        const stats = ownValue(source, ["stats"]);
+        const candidates = [
+          ["pieceCounter", ownValue(source, ["pieceCounter"])],
+          ["piecesPlaced", ownValue(source, ["piecesPlaced"])],
+          ["piecesplaced", ownValue(source, ["piecesplaced"])],
+          ["piececount", ownValue(source, ["piececount"])],
+          ["stats.piecesPlaced", ownValue(stats, ["piecesPlaced"])],
+          ["stats.pieces", ownValue(stats, ["pieces"])],
+          ["boardState.pieceCounter", basePath.endsWith("boardState") ? ownValue(source, ["pieceCounter"]) : undefined],
+          ["pieces", ownValue(source, ["pieces"])]
+        ];
+        for (const [counterSource, candidateValue] of candidates) {
+          const normalized = integerCounter(candidateValue);
+          if (normalized !== null) {
+            return {
+              value: normalized,
+              source: counterSource === "boardState.pieceCounter" ? counterSource : basePath + "." + counterSource,
+              path: counterSource === "boardState.pieceCounter" ? basePath + ".pieceCounter" : basePath + "." + counterSource
+            };
+          }
         }
       }
-      return { value: null, source: null };
+      return { value: null, source: "derived-revision", path: "" };
     };
-    const rotationFrom = (...values) => {
-      for (const value of values) {
-        if (value === null || value === undefined) continue;
-        if (typeof value === "number" && Number.isFinite(value)) {
-          const normalized = ((Math.floor(value) % 4) + 4) % 4;
-          return ["north", "east", "south", "west"][normalized] ?? null;
-        }
-        if (typeof value === "string") {
-          const text = value.trim().toLowerCase();
-          if (!text) continue;
-          if (["north", "n", "spawn", "0"].includes(text)) return "north";
-          if (["east", "e", "right", "r", "1"].includes(text)) return "east";
-          if (["south", "s", "2"].includes(text)) return "south";
-          if (["west", "w", "left", "l", "3"].includes(text)) return "west";
-        }
+    const safeType = (value) => {
+      if (value === null) return "null";
+      if (Array.isArray(value)) return "array";
+      return typeof value;
+    };
+    const summarizeValue = (value, depth = 0, seen = new WeakSet()) => {
+      if (value === null || value === undefined) return value;
+      if (typeof value === "string") return value.length > 100 ? value.slice(0, 100) + "..." : value;
+      if (typeof value === "number" || typeof value === "boolean") return value;
+      if (typeof value === "function") return "[function]";
+      if (Array.isArray(value)) {
+        return {
+          type: "array",
+          length: value.length,
+          head: value.slice(0, 14).map((item) => summarizeValue(item, depth + 1, seen))
+        };
       }
-      return null;
+      if (typeof value === "object") {
+        if (seen.has(value)) {
+          return "[circular]";
+        }
+        if (depth >= 3) {
+          return {
+            type: "object",
+            keys: safeOwnKeys(value, 20)
+          };
+        }
+        seen.add(value);
+        const summary = {
+          type: "object",
+          keys: safeOwnKeys(value, 20),
+          values: {}
+        };
+        for (const key of summary.keys.slice(0, 8)) {
+          const child = ownValue(value, [key]);
+          if (key === "board") {
+            summary.values[key] = "[board omitted]";
+            continue;
+          }
+          summary.values[key] = summarizeValue(child, depth + 1, seen);
+        }
+        return summary;
+      }
+      return String(value);
     };
-    const looksLikeGame = (value) =>
-      value &&
-      typeof value === "object" &&
-      typeof value.ejectState === "function" &&
-      typeof value.ejectBoardState === "function";
-    const candidateEnded = (candidate) => {
-      if (!looksLikeGame(candidate)) return false;
-
+    const logCandidateRoot = (candidate, locator) => {
+      const objectId = getObjectId(candidate);
+      const proto = safeProto(candidate);
+      const proto2 = proto ? safeProto(proto) : null;
+      const ownKeys = safeOwnKeys(candidate, 40);
+      const protoKeys = proto ? safeOwnKeys(proto, 40) : [];
+      const proto2Keys = proto2 ? safeOwnKeys(proto2, 40) : [];
+      const methods = ownKeys.filter((key) => typeof ownValue(candidate, [key]) === "function").slice(0, 40);
+      const constructorName = ownValue(candidate, ["constructor"])?.name ?? candidate?.constructor?.name ?? "unknown";
+      logOnce("solo-root:" + objectId + ":" + locator, [
+        "[solo-probe] locator=" + locator,
+        "[solo-probe] constructor=" + constructorName,
+        "[solo-probe] toString=" + Object.prototype.toString.call(candidate),
+        "[solo-probe] ownKeys=" + JSON.stringify(ownKeys),
+        "[solo-probe] protoKeys=" + JSON.stringify(protoKeys),
+        "[solo-probe] proto2Keys=" + JSON.stringify(proto2Keys),
+        "[solo-probe] methods=" + JSON.stringify(methods),
+        "[solo-probe] ejectState=" + typeof ownValue(candidate, ["ejectState"]),
+        "[solo-probe] ejectBoardState=" + typeof ownValue(candidate, ["ejectBoardState"]),
+        "[solo-probe] fields=" + JSON.stringify({
+          board: ownValue(candidate, ["board"]) !== undefined,
+          state: ownValue(candidate, ["state"]) !== undefined,
+          game: ownValue(candidate, ["game"]) !== undefined,
+          engine: ownValue(candidate, ["engine"]) !== undefined
+        })
+      ]);
+    };
+    const safeCall = (owner, methodName, label) => {
       try {
-        const exported = candidate.ejectState();
-        const state =
-          exported && typeof exported === "object" && exported.game
-            ? exported.game
-            : exported;
-
-        return Boolean(
-          state?.destroyed ||
-          state?.dead ||
-          state?.gameover
-        );
-      } catch {
-        return false;
-      }
-    };
-    const usableGame = (candidate) => {
-      if (!looksLikeGame(candidate)) return false;
-
-      if (candidate === window.__fusionEndedTetrioGame) {
-        if (candidateEnded(candidate)) {
-          return false;
+        const method = ownValue(owner, [methodName]);
+        if (typeof method !== "function") {
+          return { ok: false, reason: "missing" };
         }
-
-        delete window.__fusionEndedTetrioGame;
+        const value = method.call(owner);
+        logOnce("solo-return:" + getObjectId(owner) + ":" + methodName, [
+          "[solo-probe] " + label + ".type=" + safeType(value),
+          "[solo-probe] " + label + ".summary=" + JSON.stringify(summarizeValue(value))
+        ]);
+        return { ok: true, value };
+      } catch (error) {
+        logOnce("solo-return-error:" + getObjectId(owner) + ":" + methodName, [
+          "[solo-probe] " + label + ".error=" + (error?.message ?? String(error)),
+          "[solo-probe] " + label + ".stack=" + String(error?.stack ?? "")
+        ]);
+        return { ok: false, reason: error?.message ?? String(error) };
       }
-
-      return true;
     };
-    const scanObject = (root, limit = 200) => {
-      if (!root || typeof root !== "object") return null;
-      let names = [];
-      try { names = Object.getOwnPropertyNames(root).slice(0, limit); } catch {}
-      for (const name of names) {
-        try {
-          const value = root[name];
-          if (usableGame(value)) return value;
-        } catch {}
+    const analyzeCandidate = (candidate, pathLabel) => {
+      if (!isObjectLike(candidate) || isSkippable(candidate)) return null;
+      logCandidateRoot(candidate, pathLabel);
+      const ejectStateResult = safeCall(candidate, "ejectState", pathLabel + ".ejectState");
+      const ejectBoardStateResult = safeCall(candidate, "ejectBoardState", pathLabel + ".ejectBoardState");
+      const exported = ejectStateResult.ok ? ejectStateResult.value : null;
+      const boardState = ejectBoardStateResult.ok ? ejectBoardStateResult.value : null;
+      const stateRoot =
+        exported && typeof exported === "object"
+          ? ownValue(exported, ["game"]) ?? ownValue(exported, ["state"]) ?? ownValue(exported, ["engine"]) ?? exported
+          : null;
+      const boardSources = [
+        [pathLabel + ".state", stateRoot],
+        [pathLabel + ".boardState", boardState],
+        [pathLabel + ".exported", exported],
+        [pathLabel, candidate]
+      ].filter((item) => isObjectLike(item[1]));
+      let board = null;
+      let boardPath = "";
+      for (const [basePath, source] of boardSources) {
+        const extracted = boardFromMatrix(source);
+        if (extracted) {
+          board = extracted;
+          boardPath = basePath;
+          break;
+        }
       }
-      return null;
+      const pieceSources = [
+        [pathLabel + ".state", stateRoot],
+        [pathLabel + ".boardState", boardState],
+        [pathLabel + ".exported", exported],
+        [pathLabel, candidate]
+      ].filter((item) => isObjectLike(item[1]));
+      const currentInfo = pickPiece(pieceSources, ["falling", "current", "active", "piece", "tetromino"]);
+      const holdInfo = pickPiece(pieceSources, ["hold", "held", "reserve"]);
+      const queueInfo = pickQueue(pieceSources);
+      const pieceCounterInfo = selectPieceCounter(pieceSources);
+      const hasEjectState = typeof ownValue(candidate, ["ejectState"]) === "function";
+      const hasEjectBoardState = typeof ownValue(candidate, ["ejectBoardState"]) === "function";
+      const validBoard = Array.isArray(board) && board.length > 0;
+      const validCurrent = Boolean(currentInfo.piece);
+      const validQueue = queueInfo.queue.length >= 3;
+      const score =
+        (hasEjectState ? 3 : 0) +
+        (hasEjectBoardState ? 3 : 0) +
+        (validBoard ? 4 : 0) +
+        (validCurrent ? 3 : 0) +
+        (validQueue ? 3 : 0) +
+        (holdInfo.piece ? 1 : 0) +
+        (pieceCounterInfo.value !== null ? 1 : 0);
+      logOnce("solo-candidate:" + getObjectId(candidate) + ":" + pathLabel, [
+        "[solo-candidate] path=" + pathLabel + " score=" + score +
+          " board=" + (validBoard ? "yes" : "no") +
+          " current=" + (validCurrent ? "yes" : "no") +
+          " queue=" + (validQueue ? "yes" : "no")
+      ]);
+      return {
+        path: pathLabel,
+        game: candidate,
+        exported,
+        boardState,
+        stateRoot,
+        board,
+        boardPath,
+        current: currentInfo.piece,
+        currentValue: currentInfo.value,
+        currentPath: currentInfo.path,
+        hold: holdInfo.piece,
+        holdPath: holdInfo.path,
+        queue: queueInfo.queue,
+        queuePath: queueInfo.path,
+        pieceCounter: pieceCounterInfo.value,
+        pieceCounterSource: pieceCounterInfo.value !== null ? pieceCounterInfo.source : "derived-revision",
+        pieceCounterPath: pieceCounterInfo.path,
+        score,
+        valid: validBoard && validCurrent && validQueue && (hasEjectState || hasEjectBoardState)
+      };
     };
-    const findGame = () => {
-      const direct = [window.__fusionTetrioGame, window.tetrioGame, window.TETRIO_GAME, window.game, window.app, window.tetrio];
-      for (const candidate of direct) {
-        if (usableGame(candidate)) return candidate;
-        const nested = scanObject(candidate);
-        if (nested) return nested;
-      }
-      const names = Object.getOwnPropertyNames(window).slice(0, 1500);
-      for (const name of names) {
-        try {
-          const value = window[name];
-          if (usableGame(value)) return value;
-        } catch {}
-      }
-      return null;
+    const candidateEnded = (candidateInfo) => {
+      const state = candidateInfo?.stateRoot;
+      return Boolean(state?.destroyed || state?.dead || state?.gameover);
     };
-
-    const game = findGame();
-    if (!game) {
-      return { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" };
+    const queue = [];
+    const pushCandidate = (value, pathLabel, depth) => {
+      if (!isObjectLike(value) || isSkippable(value)) return;
+      queue.push({ value, path: pathLabel, depth });
+    };
+    pushCandidate(window.__fusionSoloRootCandidate, "closure:Ai", 0);
+    pushCandidate(window.__fusionTetrioGame, "window.__fusionTetrioGame", 0);
+    pushCandidate(window.tetrioGame, "window.tetrioGame", 0);
+    pushCandidate(window.TETRIO_GAME, "window.TETRIO_GAME", 0);
+    pushCandidate(window.game, "window.game", 0);
+    pushCandidate(window.app, "window.app", 0);
+    pushCandidate(window.tetrio, "window.tetrio", 0);
+    const visited = new WeakSet();
+    let visitedCount = 0;
+    let bestValid = null;
+    let bestAny = null;
+    while (queue.length > 0 && visitedCount < 200) {
+      const current = queue.shift();
+      if (!current || !isObjectLike(current.value) || isSkippable(current.value)) continue;
+      if (visited.has(current.value)) continue;
+      visited.add(current.value);
+      visitedCount += 1;
+      const analyzed = analyzeCandidate(current.value, current.path);
+      if (analyzed && !candidateEnded(analyzed)) {
+        if (!bestAny || analyzed.score > bestAny.score) {
+          bestAny = analyzed;
+        }
+        if (
+          analyzed.valid &&
+          (!bestValid ||
+            analyzed.score > bestValid.score ||
+            (analyzed.score === bestValid.score && analyzed.path.length < bestValid.path.length))
+        ) {
+          bestValid = analyzed;
+        }
+      }
+      if (current.depth >= 3) {
+        continue;
+      }
+      for (const child of ownValueEntries(current.value, current.path, 40)) {
+        if (!isObjectLike(child.value) || isSkippable(child.value)) continue;
+        pushCandidate(child.value, child.path, current.depth + 1);
+      }
     }
+    const selected = bestValid ?? bestAny;
+    if (!selected) {
+      return { ok: false, ready: false, reason: "TETR.IO game instance not captured yet", probeLogs: logs };
+    }
+    logOnce("solo-selected:" + getObjectId(selected.game), [
+      "[solo-probe] selectedPath=" + selected.path,
+      "[solo-probe] currentPath=" + (selected.currentPath || "missing"),
+      "[solo-probe] boardPath=" + (selected.boardPath || "missing"),
+      "[solo-probe] holdPath=" + (selected.holdPath || "missing"),
+      "[solo-probe] queuePath=" + (selected.queuePath || "missing"),
+      "[solo-probe] pieceCounterPath=" + (selected.pieceCounterPath || "derived-revision")
+    ]);
+    window.__fusionTetrioGame = selected.game;
     if (!window.__fusionGameObjectIds || typeof window.__fusionGameObjectIds !== "object") {
       window.__fusionGameObjectIds = {
         nextId: 1,
@@ -3675,102 +4153,112 @@ export function tetrioStateExpression() {
     if (!(window.__fusionGameObjectIds.ids instanceof WeakMap)) {
       window.__fusionGameObjectIds.ids = new WeakMap();
     }
-    let gameObjectId = window.__fusionGameObjectIds.ids.get(game);
+    let gameObjectId = window.__fusionGameObjectIds.ids.get(selected.game);
     if (!gameObjectId) {
       gameObjectId = String(window.__fusionGameObjectIds.nextId++);
-      window.__fusionGameObjectIds.ids.set(game, gameObjectId);
+      window.__fusionGameObjectIds.ids.set(selected.game, gameObjectId);
     }
-    window.__fusionTetrioGame = game;
-    const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
-    const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
-    const state = exported && typeof exported === "object" && exported.game ? exported.game : exported;
-    if (!state || typeof state !== "object") {
-      return { ok: false, ready: false, reason: "TETR.IO game state is not available" };
+    if (!selected.valid) {
+      if (!selected.board) {
+        return { ok: false, ready: false, reason: "TETR.IO board is not available", probeLogs: logs };
+      }
+      if (!selected.current) {
+        logOnce("solo-current-missing:" + getObjectId(selected.game), ["[solo] current unavailable"]);
+        return { ok: false, ready: false, reason: "TETR.IO current piece is not available", probeLogs: logs };
+      }
+      return { ok: false, ready: false, reason: "TETR.IO queue is not available", probeLogs: logs };
     }
-
-    const board =
-      Array.isArray(state.board) ? state.board :
-      Array.isArray(boardState?.b) ? boardState.b :
-      null;
-    if (!Array.isArray(board) || board.length === 0) {
-      return { ok: false, ready: false, reason: "TETR.IO board is not available" };
-    }
-
-    const activeState = state.falling ?? state.active ?? state.current ?? state.piece;
-    const current = normalizePiece(activeState);
-    const hold = normalizePiece(state.hold ?? state.held);
-    const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
-    const stats = state.stats ?? {};
-    const pieceCounter = selectPieceCounter(state, stats);
-    const linesClearedRaw = numberFrom(
-      stats.lines,
-      stats.linesCleared,
-      stats.lines_cleared,
-      state?.stats?.lines,
-      state?.stats?.linesCleared,
-      state?.stats?.lines_cleared
-    );
-    const linesCleared =
-      linesClearedRaw === null ? null : Math.max(0, Math.floor(linesClearedRaw));
-    if (!current || pieceCounter.value === null) {
-      return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
-    }
-
+    const state = selected.stateRoot ?? {};
+    const stats = ownValue(state, ["stats"]) ?? {};
+    const activeState = selected.currentValue ?? ownValue(state, ["falling", "active", "current", "piece"]);
     const activeX = integerFrom(
-      activeState?.x,
-      activeState?.col,
-      activeState?.column,
-      activeState?.cx
+      ownValue(activeState, ["x"]),
+      ownValue(activeState, ["col"]),
+      ownValue(activeState, ["column"]),
+      ownValue(activeState, ["cx"])
     );
     const activeY = integerFrom(
-      activeState?.y,
-      activeState?.row,
-      activeState?.cy
+      ownValue(activeState, ["y"]),
+      ownValue(activeState, ["row"]),
+      ownValue(activeState, ["cy"])
     );
-    const activeRotation = rotationFrom(
-      activeState?.rotation,
-      activeState?.rot,
-      activeState?.orientation,
-      activeState?.dir,
-      activeState?.state
-    );
-
+    const activeRotation = (() => {
+      const values = [
+        ownValue(activeState, ["rotation"]),
+        ownValue(activeState, ["rot"]),
+        ownValue(activeState, ["orientation"]),
+        ownValue(activeState, ["dir"]),
+        ownValue(activeState, ["state"])
+      ];
+      for (const value of values) {
+        if (value === null || value === undefined) continue;
+        if (typeof value === "number" && Number.isFinite(value)) {
+          const normalized = ((Math.floor(value) % 4) + 4) % 4;
+          return ["north", "east", "south", "west"][normalized] ?? null;
+        }
+        if (typeof value === "string") {
+          const text = value.trim().toLowerCase();
+          if (["north", "n", "spawn", "0"].includes(text)) return "north";
+          if (["east", "e", "right", "r", "1"].includes(text)) return "east";
+          if (["south", "s", "2"].includes(text)) return "south";
+          if (["west", "w", "left", "l", "3"].includes(text)) return "west";
+        }
+      }
+      return null;
+    })();
     const playing =
-      typeof game.isPlaying === "function" ? Boolean(game.isPlaying()) :
+      typeof selected.game.isPlaying === "function" ? Boolean(selected.game.isPlaying()) :
       typeof state.playing === "boolean" ? state.playing :
       typeof state.paused === "boolean" ? !state.paused :
       true;
     const started =
-      typeof game.isStarted === "function" ? Boolean(game.isStarted()) :
+      typeof selected.game.isStarted === "function" ? Boolean(selected.game.isStarted()) :
       Boolean(state.started ?? true);
     const destroyed = Boolean(state.destroyed || state.dead || state.gameover);
     const countdown = started && !destroyed && !playing;
     const ready = started && !destroyed;
     const field = Array.from({ length: 40 }, (_, rowIndex) => {
-      const sourceRow = board[board.length - 1 - rowIndex];
+      const sourceRow = selected.board[selected.board.length - 1 - rowIndex];
       const cells = rowCells(sourceRow);
       return Array.from({ length: 10 }, (_, x) => filled(cells ? cells[x] : null));
     });
+    if (selected.pieceCounter === null) {
+      logOnce("solo-piece-counter-missing:" + getObjectId(selected.game), ["[solo] pieceCounter unavailable"]);
+    } else {
+      logOnce(
+        "solo-piece-counter-ready:" + getObjectId(selected.game) + ":" + selected.current + ":" + selected.pieceCounter,
+        ["[solo] current=" + selected.current.toUpperCase() + " pieceCounterSource=" + selected.pieceCounterSource + " value=" + selected.pieceCounter]
+      );
+    }
     return {
       ok: true,
       ready,
       reason: ready ? null : !started ? "TETR.IO game is not started" : "TETR.IO game ended",
       field,
-      current,
-      hold,
-      queue,
-      b2b: Math.max(0, numberFrom(stats.b2b, state.b2b, 0) ?? 0) > 0,
-      combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
-      incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
-      pieceCounter: pieceCounter.value,
-      pieceCounterSource: pieceCounter.source,
+      current: selected.current,
+      hold: selected.hold,
+      queue: selected.queue,
+      b2b: Math.max(0, numberFrom(ownValue(stats, ["b2b"]), ownValue(state, ["b2b"]), 0) ?? 0) > 0,
+      combo: Math.max(0, numberFrom(ownValue(stats, ["combo"]), ownValue(state, ["combo"]), 0) ?? 0),
+      incoming: Math.max(0, numberFrom(ownValue(stats, ["impendingdamage"]), ownValue(state, ["incoming"]), 0) ?? 0),
+      pieceCounter: selected.pieceCounter,
+      pieceCounterSource: selected.pieceCounterSource,
       gameObjectId,
-      linesCleared: linesCleared ?? undefined,
+      gamePath: selected.path,
+      linesCleared: (() => {
+        const linesClearedRaw = numberFrom(
+          ownValue(stats, ["lines"]),
+          ownValue(stats, ["linesCleared"]),
+          ownValue(stats, ["lines_cleared"])
+        );
+        return linesClearedRaw === null ? undefined : Math.max(0, Math.floor(linesClearedRaw));
+      })(),
       playing,
       countdown,
       activeX,
       activeY,
-      activeRotation
+      activeRotation,
+      probeLogs: logs
     };
   })()`;
 }

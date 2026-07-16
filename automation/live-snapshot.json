@@ -1,0 +1,19 @@
+{
+  "ok": false,
+  "source": "browser_cdp",
+  "mode": "Solo",
+  "reason": "TETR.IO current piece or piece counter is not available",
+  "ready": false,
+  "playing": false,
+  "sessionId": null,
+  "gameId": null,
+  "roundId": null,
+  "board": null,
+  "current": null,
+  "hold": null,
+  "queue": [],
+  "pieceCounter": null,
+  "pieceCounterSource": null,
+  "token": null,
+  "capturedAt": 1784164729507
+}
