@@ -39,8 +39,7 @@ DEFAULT_CONFIG = {
         "use_ribbon_websocket": True,
         "use_seed_simulation_fallback": False,
         "required_queue_length": 5,
-        "max_restart_attempts": 3,
-        "restart_window_sec": 60,
+        "max_restart_delay_sec": 5,
     }
 }
 
@@ -278,6 +277,7 @@ class TetrioStateSource:
         self.browser_connected = False
         self.last_valid_snapshot = None
         self.restart_times = []
+        self.restart_backoff_sec = 0.5
         self.next_restart_allowed_at = 0.0
         self._last_session_id = None
         self._last_game_key = None
@@ -286,6 +286,10 @@ class TetrioStateSource:
         self._last_captured_at = None
         self._last_token = None
         self._last_snapshot_seen = False
+        self._pending_restart_record = False
+        self._helper_started_at_ms = 0
+        self._closing_pids = set()
+        self._last_pipe_warning = ""
 
     def _reset_sequence_guard(self) -> None:
         self._last_session_id = None
@@ -301,31 +305,59 @@ class TetrioStateSource:
             self.close(restart=False)
             self.start()
 
+    def _is_process_running(self):
+        proc = self.proc
+        return proc is not None and proc.poll() is None
+
+    def _get_max_restart_delay_sec(self):
+        raw_value = self.config.get("tetrio_cdp", {}).get("max_restart_delay_sec", 5)
+        try:
+            return max(0.5, min(5.0, float(raw_value)))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _clear_restart_backoff(self):
+        with self.lock:
+            self.restart_times.clear()
+            self.next_restart_allowed_at = 0.0
+            self.restart_backoff_sec = 0.5
+            self._pending_restart_record = False
+
+    def _mark_helper_success(self, reason=None):
+        with self.lock:
+            self.last_error = ""
+            self.last_error_at = 0
+            if reason:
+                self.last_reason = reason
+        self._clear_restart_backoff()
+
+    def _remember_pipe_warning(self, text):
+        with self.lock:
+            if text == self._last_pipe_warning:
+                return
+            self._last_pipe_warning = text
+            self.last_log_line = text
+
+    def _schedule_restart_after_exit(self):
+        with self.lock:
+            self._pending_restart_record = True
+            delay_sec = min(self._get_max_restart_delay_sec(), max(0.5, self.restart_backoff_sec))
+            self.next_restart_allowed_at = time.time() + delay_sec
+            self.restart_backoff_sec = min(self._get_max_restart_delay_sec(), max(0.5, delay_sec * 2.0))
+
     def start(self):
         with self.lock:
-            if self.proc is not None and self.proc.poll() is None:
+            if self._is_process_running():
                 return
             if self.proc is not None and self.proc.poll() is not None:
                 self.proc = None
             now = time.time()
-            if now < self.next_restart_allowed_at:
+            if self._pending_restart_record and now < self.next_restart_allowed_at:
                 wait_sec = max(0.1, self.next_restart_allowed_at - now)
                 raise RuntimeError(f"CDP source 재시작 대기 중입니다. {wait_sec:.1f}초 후 다시 시도합니다.")
-            self._prune_restarts()
-            cdp_config = self.config["tetrio_cdp"]
-            max_restart_attempts = int(cdp_config.get("max_restart_attempts", 3))
-            restart_window_sec = max(1, int(cdp_config.get("restart_window_sec", 60)))
-            if len(self.restart_times) >= max_restart_attempts:
-                oldest_restart = self.restart_times[0]
-                self.next_restart_allowed_at = oldest_restart + restart_window_sec
-                wait_sec = max(0.1, self.next_restart_allowed_at - now)
-                raise RuntimeError(
-                    f"CDP source 재시작 한도를 초과했습니다. {wait_sec:.1f}초 후 자동으로 다시 시도합니다."
-                )
-            if len(self.restart_times) >= int(cdp_config.get("max_restart_attempts", 3)):
-                raise RuntimeError("CDP source 재시작 한도를 초과했습니다.")
-
-            self.restart_times.append(now)
+            if self._pending_restart_record:
+                self.restart_times.append(now)
+                self._pending_restart_record = False
             self.next_restart_allowed_at = 0.0
             command = self._build_command()
             env = os.environ.copy()
@@ -343,6 +375,9 @@ class TetrioStateSource:
                 creationflags=creationflags,
                 env=env,
             )
+            self._helper_started_at_ms = int(time.time() * 1000)
+            self._last_snapshot_seen = False
+            self.last_reason = "Waiting for game state"
             self.last_ready = False
             self.browser_connected = False
             self.last_valid_snapshot = None
@@ -354,6 +389,8 @@ class TetrioStateSource:
         with self.lock:
             proc = self.proc
             self.proc = None
+            if proc is not None and getattr(proc, "pid", None) is not None:
+                self._closing_pids.add(proc.pid)
 
         if proc is not None:
             try:
@@ -405,6 +442,19 @@ class TetrioStateSource:
 
             if not isinstance(payload, dict):
                 self._remember_error("snapshot JSON이 객체가 아닙니다.")
+                self.last_valid_snapshot = None
+                return None
+
+            try:
+                captured_at = int(payload.get("capturedAt") or 0)
+            except (TypeError, ValueError):
+                captured_at = 0
+            if (
+                self._helper_started_at_ms > 0
+                and captured_at > 0
+                and captured_at < self._helper_started_at_ms
+            ):
+                self.last_reason = "Waiting for game state"
                 self.last_valid_snapshot = None
                 return None
 
@@ -461,6 +511,7 @@ class TetrioStateSource:
             self._last_captured_at = snapshot.captured_at
             self._last_token = snapshot.token
             self.last_reason = "Ready"
+            self._mark_helper_success("Ready")
             return snapshot
 
     def get_status(self):
@@ -469,7 +520,7 @@ class TetrioStateSource:
         except Exception as exc:
             self._remember_error(f"상태 갱신 실패: {exc}")
             snapshot = None
-        helper_running = self.proc is not None and self.proc.poll() is None
+        helper_running = self._is_process_running()
         browser_status = "Connected" if self.browser_connected else "Disconnected"
         game_state = "Ready"
         detail = self.last_reason
@@ -538,11 +589,12 @@ class TetrioStateSource:
         return command
 
     def _ensure_running(self):
-        if self.proc is not None and self.proc.poll() is None:
-            return
-        self.browser_connected = False
-        self.last_ready = False
-        self._reset_sequence_guard()
+        with self.lock:
+            if self._is_process_running():
+                return
+            self.browser_connected = False
+            self.last_ready = False
+            self._reset_sequence_guard()
         try:
             self.start()
         except Exception as exc:
@@ -568,13 +620,14 @@ class TetrioStateSource:
                     if payload and payload.get("type") == "ready":
                         self.last_ready = True
                         self.browser_connected = True
-                        self.last_reason = "Browser connected"
+                        self._mark_helper_success("Browser connected")
                         continue
 
                 lowered = line.lower()
                 if "[browser] connected" in lowered:
                     self.browser_connected = True
                     self.last_ready = True
+                    self._mark_helper_success("Browser connected")
                 elif "[browser] fatal:" in lowered:
                     self._remember_error(line)
                 elif "[browser]" in lowered:
@@ -583,15 +636,36 @@ class TetrioStateSource:
             self._remember_error(f"helper stdout reader failed: {exc!r}")
         finally:
             exit_code = proc.poll()
+            if exit_code is None:
+                self._remember_pipe_warning(
+                    f"[CDP PIPE EOF] stdout closed while process is still alive pid={getattr(proc, 'pid', '?')}"
+                )
+                try:
+                    exit_code = proc.wait()
+                except Exception as exc:
+                    self._remember_error(f"CDP helper wait 실패: {exc!r}")
+                    exit_code = None
+
             if exit_code is not None:
-                self._remember_error(f"CDP helper가 종료되었습니다. exit code={exit_code}")
-                self.browser_connected = False
-                self.last_ready = False
-                self.last_valid_snapshot = None
-                self._reset_sequence_guard()
+                pid = getattr(proc, "pid", None)
+                intentional_close = False
                 with self.lock:
+                    if pid is not None and pid in self._closing_pids:
+                        self._closing_pids.discard(pid)
+                        intentional_close = True
+
                     if self.proc is proc:
                         self.proc = None
+
+                    if not intentional_close:
+                        self.browser_connected = False
+                        self.last_ready = False
+                        self.last_valid_snapshot = None
+                        self._reset_sequence_guard()
+
+                if not intentional_close:
+                    self._schedule_restart_after_exit()
+                    self._remember_error(f"CDP helper가 종료되었습니다. exit code={exit_code}")
 
     def _read_snapshot_payload(self):
         snapshot_path = self._resolve_runtime_path(self.config["tetrio_cdp"]["snapshot_path"])
@@ -624,11 +698,6 @@ class TetrioStateSource:
             self.last_error = text
             self.last_error_at = now
         self.last_reason = text
-
-    def _prune_restarts(self):
-        window_sec = int(self.config["tetrio_cdp"].get("restart_window_sec", 60))
-        cutoff = time.time() - max(1, window_sec)
-        self.restart_times = [item for item in self.restart_times if item >= cutoff]
 
     @staticmethod
     def _get_node_executable():
