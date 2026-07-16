@@ -236,11 +236,13 @@ class GomenSession:
         if proc is None:
             return
 
-        try:
-            if proc.stdin is not None and proc.poll() is None:
-                proc.stdin.close()
-        except Exception:
-            pass
+        for stream_name in ("stdin", "stdout", "stderr"):
+            try:
+                stream = getattr(proc, stream_name, None)
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
         try:
             proc.wait(timeout=1.0)
@@ -254,6 +256,9 @@ class GomenSession:
             except Exception:
                 pass
         self.last_exit_code = proc.poll()
+        for thread in (self.reader_thread, self.stderr_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.0)
 
 
 def get_app_base_dir():

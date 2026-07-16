@@ -1,5 +1,6 @@
 import ctypes
 import threading
+import traceback
 from itertools import combinations
 import tkinter as tk
 from tkinter import messagebox
@@ -15,14 +16,6 @@ except Exception:
     find_setup_candidates_for_pc = None
     find_setup_for_pc = None
 
-from hydra_helper import (
-    HydraError,
-    close_hydra_sessions,
-    make_hydra_see_string,
-    run_hydra_auto_active,
-    run_hydra_with_solution,
-    warm_hydra_session,
-)
 from gomen_helper import (
     GomenError,
     close_gomen_sessions,
@@ -77,7 +70,7 @@ class TetrisScannerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PYHOK12 TETR.IO CDP")
-        self.root.geometry("620x1060")
+        self.root.geometry("620x890")
         self.root.resizable(False, False)
 
         self.config = load_config("config.json")
@@ -93,32 +86,25 @@ class TetrisScannerApp:
         self.auto_scan_job = None
         self.hotkey_poll_job = None
         self.is_scanning = False
-        self.is_hydra_running = False
         self.is_pc_solving = False
         self.is_closing = False
-        self.is_hydra_warming = False
-        self.hydra_warm_ready = False
         self.is_pc_solver_warming = False
         self.pc_solver_warm_ready = False
-        self.enable_hold_solution_variant = False
         self.hotkey_pressed = {
             VK_DELETE: False,
             VK_END: False,
         }
 
-        self.active_var = tk.StringVar(value="")
-        self.manual_see_var = tk.StringVar(value="")
-        self.bag_var = tk.StringVar(value="7")
         self.always_on_top = tk.BooleanVar(value=True)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.cell_size = 21
+        self.cell_size = 17
         self.board_cols = 10
         self.board_rows = 20
         self.solve_card_cell_size = 7
         self.solve_canvas_width = 292
-        self.solve_canvas_height = 420
+        self.solve_canvas_height = 320
 
         self.title_label = tk.Label(
             root,
@@ -187,77 +173,19 @@ class TetrisScannerApp:
         self.pc_round_label.pack(fill="x", padx=16, pady=(0, 4))
         self.browser_status_var = tk.StringVar(value="Browser: Connecting")
         self.game_state_var = tk.StringVar(value="Game state: Waiting")
-        self.mode_var = tk.StringVar(value="Mode: Unknown")
-        self.identity_var = tk.StringVar(value="Game ID: -")
         self.counter_var = tk.StringVar(value="Piece counter: -")
-        self.board_size_var = tk.StringVar(value="Board size: -")
         self.queue_status_var = tk.StringVar(value="Current/Hold/Queue: -")
         self.age_var = tk.StringVar(value="Last update age: -")
         self.detail_var = tk.StringVar(value="Detail: Waiting for game state")
+        self.pc_solver_status_var = tk.StringVar(value="PC SOLVER: 대기 중")
         self.build_state_status_panel()
-        self.hydra_frame = tk.LabelFrame(
+        self.pc_solver_status_label = tk.Label(
             root,
-            text="HYDRA PC SOLVER",
+            textvariable=self.pc_solver_status_var,
+            anchor="w",
             font=("Malgun Gothic", 10, "bold"),
         )
-        self.hydra_frame.pack(fill="x", padx=14, pady=(0, 6))
-
-        tk.Label(self.hydra_frame, text="ACTIVE", font=("Malgun Gothic", 9)).grid(
-            row=0, column=0, padx=4, pady=4
-        )
-        self.active_entry = tk.Entry(
-            self.hydra_frame,
-            textvariable=self.active_var,
-            width=5,
-            font=("Consolas", 11),
-        )
-        self.active_entry.grid(row=0, column=1, padx=4, pady=4)
-
-        tk.Label(self.hydra_frame, text="SEE 직접입력", font=("Malgun Gothic", 9)).grid(
-            row=0, column=2, padx=4, pady=4
-        )
-        self.manual_see_entry = tk.Entry(
-            self.hydra_frame,
-            textvariable=self.manual_see_var,
-            width=14,
-            font=("Consolas", 11),
-        )
-        self.manual_see_entry.grid(row=0, column=3, padx=4, pady=4)
-
-        tk.Label(self.hydra_frame, text="BAG", font=("Malgun Gothic", 9)).grid(
-            row=0, column=4, padx=4, pady=4
-        )
-        self.bag_entry = tk.Entry(
-            self.hydra_frame,
-            textvariable=self.bag_var,
-            width=5,
-            font=("Consolas", 11),
-        )
-        self.bag_entry.grid(row=0, column=5, padx=4, pady=4)
-
-        self.hydra_button = tk.Button(
-            self.hydra_frame,
-            text="Hydra 카드 계산",
-            width=11,
-            font=("Malgun Gothic", 9, "bold"),
-            command=self.run_hydra_now,
-        )
-        self.hydra_button.grid(row=0, column=6, padx=6, pady=4)
-
-        self.hydra_result_label = tk.Label(
-            self.hydra_frame,
-            text="HYDRA: 대기 중",
-            anchor="w",
-            font=("Malgun Gothic", 10),
-        )
-        self.hydra_result_label.grid(
-            row=1,
-            column=0,
-            columnspan=7,
-            sticky="we",
-            padx=6,
-            pady=(0, 5),
-        )
+        self.pc_solver_status_label.pack(fill="x", padx=16, pady=(0, 6))
 
         self.setup_option_frame = tk.LabelFrame(
             root,
@@ -328,7 +256,7 @@ class TetrisScannerApp:
             justify="left",
             anchor="nw",
             wraplength=self.solve_canvas_width - 4,
-            font=("Malgun Gothic", 10),
+            font=("Malgun Gothic", 9),
         )
         self.output_hint.pack(fill="x", pady=(8, 0))
         self.bind_output_scroll_events()
@@ -344,17 +272,17 @@ class TetrisScannerApp:
         self.draw_empty_board()
         self.print_message(
             "Del: PC 해법 상태 읽기 / End: 최적 셋업 상태 읽기\n"
-            "왼쪽 버튼을 골라 실행하세요.\n"
-            "PC 해법은 상세 카드,\n"
-            "최적 셋업은 셋업 카드를 표시합니다."
+            "PC 해법 또는 최적 셋업 카드가 여기에 표시됩니다."
         )
         self.bind_keyboard_shortcuts()
         self.register_global_hotkeys()
-        self.root.after(150, self.start_hydra_warmup)
         self.root.after(250, self.start_pc_solver_warmup)
         self.root.after(200, self.start_browser_source)
-        self.last_hydra_signature = None
         self.last_pc_signature = None
+        self.root.update_idletasks()
+        required_height = self.root.winfo_reqheight()
+        target_height = min(max(required_height + 12, 870), 900)
+        self.root.geometry(f"620x{target_height}")
 
     def bind_keyboard_shortcuts(self):
         self.root.bind("<Delete>", self.on_local_delete_hotkey, add="+")
@@ -451,16 +379,16 @@ class TetrisScannerApp:
         for col in range(7):
             self.setup_option_frame.grid_columnconfigure(col, weight=1)
 
-        font_small = ("Consolas", 8)
+        font_small = ("Consolas", 7)
 
         for round_num in range(1, 8):
-            group = tk.Frame(self.setup_option_frame, bd=1, relief="solid", padx=3, pady=2)
-            group.grid(row=0, column=round_num - 1, padx=2, pady=3, sticky="nsew")
+            group = tk.Frame(self.setup_option_frame, bd=1, relief="solid", padx=2, pady=1)
+            group.grid(row=0, column=round_num - 1, padx=1, pady=2, sticky="nsew")
             tk.Label(
                 group,
                 text=f"{round_num}st PC" if round_num == 1 else f"{round_num}nd PC" if round_num == 2 else f"{round_num}rd PC" if round_num == 3 else f"{round_num}th PC",
-                font=("Consolas", 8, "bold"),
-            ).grid(row=0, column=0, sticky="ew", pady=(0, 2))
+                font=("Consolas", 7, "bold"),
+            ).grid(row=0, column=0, sticky="ew", pady=(0, 1))
 
             round_vars = {}
             default = defaults.get(round_num, {})
@@ -468,7 +396,7 @@ class TetrisScannerApp:
             if round_num in (1, 2, 3):
                 mode_var = tk.StringVar(value=default.get("mode", "Simple"))
                 mode_menu = tk.OptionMenu(group, mode_var, "Simple", "Advanced")
-                mode_menu.config(font=font_small, width=8, padx=1, pady=1, indicatoron=False)
+                mode_menu.config(font=font_small, width=7, padx=1, pady=0, indicatoron=False)
                 mode_menu["menu"].config(font=font_small)
                 mode_menu.grid(row=1, column=0, sticky="ew")
                 round_vars["mode"] = mode_var
@@ -498,7 +426,7 @@ class TetrisScannerApp:
                     group,
                     text="Specific Sol%",
                     variable=specific_sol_var,
-                    font=("Consolas", 7),
+                    font=("Consolas", 6),
                     anchor="w",
                 ).grid(row=1, column=0, sticky="w")
                 priority_var = tk.StringVar(value=default.get("priority", ""))
@@ -519,22 +447,22 @@ class TetrisScannerApp:
             self.setup_option_frame,
             text="큐는 최신 CDP snapshot 값을 자동 사용합니다.",
             anchor="w",
-            font=("Malgun Gothic", 8),
+            font=("Malgun Gothic", 7),
             fg="#6f6a61",
-        ).grid(row=1, column=0, columnspan=7, sticky="w", padx=4, pady=(0, 2))
+        ).grid(row=1, column=0, columnspan=7, sticky="w", padx=3, pady=(0, 1))
 
     def create_setup_option_value_label(self, parent, variable, row):
         holder = tk.Frame(parent, bd=1, relief="sunken", bg="#fbfbfb")
-        holder.grid(row=row, column=0, sticky="ew", pady=(2, 0))
+        holder.grid(row=row, column=0, sticky="ew", pady=(1, 0))
         tk.Label(
             holder,
             textvariable=variable,
-            font=("Consolas", 8, "bold"),
+            font=("Consolas", 7, "bold"),
             bg="#fbfbfb",
             fg="#2d2d2d",
             justify="center",
-            padx=4,
-            pady=2,
+            padx=3,
+            pady=1,
         ).pack(fill="x")
 
     def build_state_status_panel(self):
@@ -545,24 +473,30 @@ class TetrisScannerApp:
         )
         self.state_frame.pack(fill="x", padx=14, pady=(0, 6))
 
-        for variable in (
+        variables = (
             self.browser_status_var,
             self.game_state_var,
-            self.mode_var,
-            self.identity_var,
             self.counter_var,
-            self.board_size_var,
             self.queue_status_var,
             self.age_var,
             self.detail_var,
-        ):
+        )
+        for column in range(2):
+            self.state_frame.grid_columnconfigure(column, weight=1)
+        for index, variable in enumerate(variables):
             tk.Label(
                 self.state_frame,
                 textvariable=variable,
                 anchor="w",
                 justify="left",
-                font=("Consolas", 9),
-            ).pack(fill="x", padx=8, pady=1)
+                font=("Consolas", 8),
+            ).grid(
+                row=index // 2,
+                column=index % 2,
+                sticky="ew",
+                padx=8,
+                pady=1,
+            )
 
     def print_message(self, text):
         self.clear_output_view(text)
@@ -638,30 +572,24 @@ class TetrisScannerApp:
             self.render_setup_empty_state("현재 옵션으로\n최적 셋업을 찾지 못했습니다.")
             self.status_label.config(text=f"현재 옵션으로 최적 셋업 없음{round_text}")
 
-    def get_scan_context(self, hydra_result=None, solver_result=None):
+    def get_scan_context(self, solver_result=None):
         result = self.last_result or {}
         active_guess = (result.get("current") or result.get("active_guess") or "").strip().upper()
-        active_input = (self.active_var.get() or "").strip().upper()
-        active_effective = active_input or active_guess or "-"
+        active_effective = active_guess or "-"
         hold = (result.get("hold") or "").strip().upper() or "-"
         queue_list = [piece for piece in (result.get("queue") or []) if piece]
         queue_text = "".join(queue_list) or "-"
-        manual_see = (self.manual_see_var.get() or "").strip().upper()
 
         if solver_result and solver_result.get("queue_text"):
             see_text = solver_result.get("queue_text")
-        elif hydra_result and hydra_result.get("see"):
-            see_text = hydra_result.get("see")
         else:
             try:
-                see_text = make_hydra_see_string(
+                see_text = make_state_queue(
                     "" if active_effective == "-" else active_effective,
-                    "" if hold == "-" else hold,
                     queue_list,
-                    manual_see=manual_see,
                 )
             except Exception:
-                see_text = manual_see or "-"
+                see_text = "-"
 
         return {
             "current": active_guess or "-",
@@ -672,11 +600,11 @@ class TetrisScannerApp:
             "see": see_text or "-",
         }
 
-    def draw_output_context_header(self, hydra_result=None, solver_result=None):
+    def draw_output_context_header(self, solver_result=None):
         if not self.last_result:
             return 0
 
-        context = self.get_scan_context(hydra_result=hydra_result, solver_result=solver_result)
+        context = self.get_scan_context(solver_result=solver_result)
         x = 8
         y = 8
         width = self.solve_canvas_width - 16
@@ -719,6 +647,10 @@ class TetrisScannerApp:
         self.pc_scan_button.config(state=state)
         self.setup_scan_button.config(state=state)
 
+    def update_action_buttons_state(self):
+        state = "disabled" if self.is_scanning or self.is_pc_solving else "normal"
+        self.set_scan_buttons_state(state)
+
     def scan_for_pc_solve(self, show_popup=True):
         self.scan(scan_target="pc_solve", show_popup=show_popup)
 
@@ -753,7 +685,6 @@ class TetrisScannerApp:
             self.state_status_job = None
         self.unregister_global_hotkeys()
         close_gomen_sessions()
-        close_hydra_sessions()
         self.state_source.close()
         self.root.destroy()
 
@@ -793,28 +724,20 @@ class TetrisScannerApp:
             status = {
                 "browser_status": "Error",
                 "game_state": "Waiting",
-                "mode": "Unknown",
-                "game_id": "",
-                "round_id": "",
                 "piece_counter": None,
-                "board_size": "-",
                 "current": "-",
                 "hold": "-",
                 "queue": "-",
                 "last_update_age_ms": None,
                 "detail": str(exc),
             }
-        identity = status.get("round_id") or status.get("game_id") or "-"
         age_ms = status.get("last_update_age_ms")
         age_text = "-" if age_ms is None else f"{age_ms}ms"
         queue_text = status.get("queue") or "-"
 
         self.browser_status_var.set(f"Browser: {status.get('browser_status', 'Unknown')}")
         self.game_state_var.set(f"Game state: {status.get('game_state', 'Unknown')}")
-        self.mode_var.set(f"Mode: {status.get('mode', 'Unknown')}")
-        self.identity_var.set(f"Game ID: {identity}")
         self.counter_var.set(f"Piece counter: {status.get('piece_counter', '-')}")
-        self.board_size_var.set(f"Board size: {status.get('board_size', '-')}")
         self.queue_status_var.set(
             f"Current/Hold/Queue: {status.get('current', '-')} / {status.get('hold', '-')} / {queue_text}"
         )
@@ -823,23 +746,12 @@ class TetrisScannerApp:
 
         self.state_status_job = self.root.after(500, self.refresh_browser_status)
 
-    def start_hydra_warmup(self):
-        if self.is_closing or self.is_hydra_warming or self.hydra_warm_ready:
-            return
-
-        self.is_hydra_warming = True
-        current_text = self.hydra_result_label.cget("text")
-        if not str(current_text).startswith("PC SOLVER"):
-            self.hydra_result_label.config(text="HYDRA: 예열 중...")
-
-        worker = threading.Thread(target=self._hydra_warmup_worker, daemon=True)
-        worker.start()
-
     def start_pc_solver_warmup(self):
         if self.is_closing or self.is_pc_solver_warming or self.pc_solver_warm_ready:
             return
 
         self.is_pc_solver_warming = True
+        self.pc_solver_status_var.set("PC SOLVER: 예열 중")
         worker = threading.Thread(target=self._pc_solver_warmup_worker, daemon=True)
         worker.start()
 
@@ -852,7 +764,7 @@ class TetrisScannerApp:
             self.status_label.config(text="PC 해법용 게임 상태 읽는 중...")
         else:
             self.status_label.config(text="최적 셋업용 게임 상태 읽는 중...")
-        self.set_scan_buttons_state("disabled")
+        self.update_action_buttons_state()
 
         worker = threading.Thread(
             target=self._scan_worker,
@@ -1002,61 +914,6 @@ class TetrisScannerApp:
             f"구조 {info['structure']}"
         )
 
-    def run_hydra_now(self, show_popup=True, force=True):
-        if self.is_hydra_running or self.is_closing:
-            return
-
-        if not self.last_result:
-            if show_popup:
-                messagebox.showwarning("Hydra", "먼저 게임 상태를 읽어야 합니다.")
-            return
-
-        board = self.last_result["board"]
-        active_guess = self.last_result.get("active_guess")
-        hold = self.last_result["hold"]
-        queue = self.last_result["queue"]
-
-        active = (self.active_var.get() or "").strip().upper()
-        manual_see = (self.manual_see_var.get() or "").strip().upper()
-        bag_arg = self.bag_var.get()
-
-        if not active and not manual_see and not active_guess and not show_popup:
-            self.hydra_result_label.config(text="HYDRA: Current piece 대기 중")
-            self.status_label.config(text="Hydra current piece 대기 중")
-            self.print_message("current piece가 준비되면 Hydra 해법 계산이 시작됩니다.")
-            return
-
-        hydra_signature = (
-            tuple("".join(row) for row in board),
-            active_guess,
-            hold,
-            tuple(queue),
-            active,
-            manual_see,
-            bag_arg,
-        )
-
-        if not force and not show_popup and hydra_signature == self.last_hydra_signature:
-            self.status_label.config(text="Hydra 계산 생략 - 같은 상태")
-            return
-
-        self.last_hydra_signature = hydra_signature
-
-        self.is_hydra_running = True
-        self.hydra_button.config(state="disabled")
-        if show_popup or self.current_output_mode != "setup":
-            self.clear_output_view("Hydra 해법 계산 중...")
-        else:
-            self.output_hint_var.set("추천 셋업 표시 중\nHydra 해법 계산 중...")
-        self.status_label.config(text="Hydra 계산 중...")
-
-        worker = threading.Thread(
-            target=self._run_hydra_worker,
-            args=(board, active_guess, hold, queue, active, manual_see, bag_arg, show_popup),
-            daemon=True,
-        )
-        worker.start()
-
     def run_pc_solver_now(self, show_popup=True, force=True):
         if self.is_pc_solving or self.is_closing:
             return
@@ -1067,25 +924,25 @@ class TetrisScannerApp:
             return
 
         board = self.last_result["board"]
-        active_guess = (self.last_result.get("active_guess") or "").strip().upper()
+        active_piece = (
+            self.last_result.get("current")
+            or self.last_result.get("active_guess")
+            or ""
+        ).strip().upper()
         hold = (self.last_result.get("hold") or "").strip().upper()
         queue = self.last_result["queue"]
-        active = (self.active_var.get() or "").strip().upper()
-        manual_see = (self.manual_see_var.get() or "").strip().upper()
 
-        if not active and not manual_see and not active_guess:
-            self.hydra_result_label.config(text="PC SOLVER: Current piece 대기 중")
+        if not active_piece:
+            self.pc_solver_status_var.set("PC SOLVER: Current piece 대기 중")
             self.status_label.config(text="PC 해법 대기 - current 없음")
             self.print_message("current piece가 준비되면 PC 해법 계산이 시작됩니다.")
             return
 
         pc_signature = (
             tuple("".join(row) for row in board),
-            active_guess,
+            active_piece,
             hold,
             tuple(queue),
-            active,
-            manual_see,
         )
         if not force and not show_popup and pc_signature == self.last_pc_signature:
             self.status_label.config(text="PC 해법 계산 생략 - 같은 상태")
@@ -1093,57 +950,23 @@ class TetrisScannerApp:
 
         self.last_pc_signature = pc_signature
         self.is_pc_solving = True
+        self.update_action_buttons_state()
 
         if show_popup or self.current_output_mode != "setup":
             self.clear_output_view("PC 해법 계산 중...")
         else:
             self.output_hint_var.set("추천 셋업 표시 중\nPC 해법 계산 중...")
 
-        self.hydra_result_label.config(text="PC SOLVER: 계산 중...")
+        self.pc_solver_status_var.set("PC SOLVER: 계산 중")
         self.status_label.config(text="PC 해법 계산 중...")
+        print("[PC SOLVER] scan success")
 
         worker = threading.Thread(
             target=self._run_pc_solver_worker,
-            args=(board, active_guess, hold, queue, active, manual_see, show_popup),
+            args=(board, active_piece, hold, queue, show_popup),
             daemon=True,
         )
         worker.start()
-
-    def render_solution_groups(self, variants, hydra_result=None):
-        self.output.delete("all")
-        self.current_output_mode = "hydra"
-
-        card_width = 260
-        card_height = 120
-        gap_y = 12
-        start_x = 8
-        start_y = self.draw_output_context_header(hydra_result=hydra_result)
-
-        summary_lines = []
-
-        visible = variants[:2]  # ACTIVE / HOLD 정도만 보여주기
-
-        for index, variant in enumerate(visible):
-            y = start_y + index * (card_height + gap_y)
-            self.draw_solution_compact_card(
-                start_x,
-                y,
-                card_width,
-                card_height,
-                variant,
-            )
-
-            solution = variant.get("solution") or {}
-            pieces = solution.get("pieces") or []
-            title = variant.get("title") or f"{index + 1}. 해법"
-            summary_lines.append(f"{title}: {' -> '.join(pieces)}")
-
-        bottom = start_y + len(visible) * (card_height + gap_y)
-        self.output.config(
-            scrollregion=(0, 0, self.solve_canvas_width, max(bottom, self.solve_canvas_height))
-        )
-        self.reset_output_scroll()
-        self.output_hint_var.set("\n".join(summary_lines))
 
     def render_pc_solution_groups(self, variants, solver_result=None):
         self.output.delete("all")
@@ -1219,70 +1042,6 @@ class TetrisScannerApp:
             font=("Consolas", 9, "bold"),
         )
 
-    def draw_solution_compact_card(self, x, y, width, height, variant):
-        solution = variant.get("solution") or {}
-        title = variant.get("title") or "해법"
-        pieces = solution.get("pieces") or []
-        preview_rows = self.build_compact_solution_rows(
-            solution,
-            setup_rows=self.get_current_solution_setup_rows(),
-        )
-
-        self.output.create_rectangle(
-            x,
-            y,
-            x + width,
-            y + height,
-            fill="#f4f1e8",
-            outline="#dfd9ca",
-        )
-
-        self.output.create_text(
-            x + 10,
-            y + 12,
-            text=title,
-            anchor="w",
-            fill="#252525",
-            font=("Consolas", 10, "bold"),
-        )
-
-        if preview_rows and any(any(ch not in ".X" for ch in row) for row in preview_rows):
-            self.draw_preview_board(
-                preview_rows,
-                x + 10,
-                y + 28,
-                cell_size=10,
-            )
-        else:
-            self.output.create_text(
-                x + 10,
-                y + 46,
-                text="배치 미리보기 복원 실패",
-                anchor="w",
-                fill="#8f6f4a",
-                font=("Malgun Gothic", 8, "bold"),
-            )
-
-        self.output.create_text(
-            x + 116,
-            y + 32,
-            text="순서",
-            anchor="w",
-            fill="#7a766d",
-            font=("Consolas", 8, "bold"),
-        )
-        self.draw_piece_strip("".join(pieces[:6]), x + 116, y + 40, block_size=14, gap=2)
-
-        piece_text = " -> ".join(pieces) if pieces else "-"
-        self.output.create_text(
-            x + 10,
-            y + 88,
-            text=piece_text,
-            anchor="w",
-            fill="#252525",
-            font=("Consolas", 9, "bold"),
-        )
-
     def decode_gomen_cells(self, cells_text):
         text = str(cells_text or "").strip().upper().replace("_", ".")
         filtered = "".join(ch for ch in text if ch in ".GIJLOSTZX")
@@ -1297,22 +1056,6 @@ class TetrisScannerApp:
         for start in range(0, 40, 10):
             rows.append(filtered[start:start + 10])
         return rows
-
-    def get_gomen_order_groups(self, solution):
-        raw_groups = solution.get("order_groups") or []
-        normalized_groups = []
-        for group in raw_groups:
-            normalized_groups.append(
-                [str(item or "").strip().upper() for item in group if item]
-            )
-
-        while len(normalized_groups) < 2:
-            normalized_groups.append([])
-
-        return {
-            "without_hold": normalized_groups[0],
-            "with_hold": normalized_groups[1],
-        }
 
     def build_pc_variant(self, index, title, solution, queue_text):
         rows = self.decode_gomen_cells(solution.get("cells", ""))
@@ -1350,101 +1093,6 @@ class TetrisScannerApp:
                 variants.append(variant)
 
         return variants
-
-    def get_current_solution_setup_rows(self):
-        board = (self.last_result or {}).get("board") or []
-        if not board:
-            return []
-
-        rows = []
-        for row in board[-4:]:
-            row_text = "".join("X" if cell != "." else "." for cell in row[:10])
-            rows.append((row_text + "." * 10)[:10])
-
-        while len(rows) < 4:
-            rows.insert(0, "." * 10)
-
-        return rows[-4:]
-
-    def clear_preview_full_rows(self, board):
-        kept = []
-        for row in board:
-            if all(cell != "." for cell in row):
-                continue
-            kept.append(row[:])
-
-        while len(kept) < 4:
-            kept.insert(0, list("." * 10))
-
-        return kept[-4:]
-
-    def build_compact_solution_rows(self, solution, setup_rows=None):
-        if not solution:
-            return []
-
-        steps = solution.get("steps") or []
-        init_rows = setup_rows or solution.get("init_rows") or []
-
-        if not init_rows and steps:
-            init_rows = steps[0].get("prev_rows") or []
-
-        board = []
-        for row in init_rows[:4]:
-            row_text = row if isinstance(row, str) else "".join(row)
-            row_text = (row_text + "." * 10)[:10]
-            board.append(list(row_text))
-
-        while len(board) < 4:
-            board.insert(0, list("." * 10))
-
-        initial_mask = set()
-        for row_index in range(4):
-            for col_index in range(10):
-                if board[row_index][col_index] != ".":
-                    board[row_index][col_index] = "X"
-                    initial_mask.add((row_index, col_index))
-
-        for step in steps:
-            piece = step.get("piece", "X")
-            placed_rows = step.get("placed_rows")
-            if not placed_rows:
-                continue
-
-            for row_index in range(min(4, len(placed_rows))):
-                row = placed_rows[row_index]
-                for col_index in range(min(10, len(row))):
-                    if row[col_index] == "X":
-                        board[row_index][col_index] = piece
-
-            board = self.clear_preview_full_rows(board)
-
-        final_rows = []
-        if steps:
-            final_rows = steps[-1].get("rows") or []
-        if not final_rows:
-            final_rows = solution.get("init_rows") or []
-
-        normalized_final = []
-        for row in final_rows[:4]:
-            row_text = row if isinstance(row, str) else "".join(row)
-            normalized_final.append((row_text + "." * 10)[:10])
-        while len(normalized_final) < 4:
-            normalized_final.insert(0, "." * 10)
-
-        for row_index in range(4):
-            for col_index in range(10):
-                final_cell = normalized_final[row_index][col_index]
-                if final_cell == "X":
-                    if (row_index, col_index) in initial_mask:
-                        board[row_index][col_index] = "X"
-                    elif board[row_index][col_index] == ".":
-                        board[row_index][col_index] = "X"
-                    else:
-                        continue
-                else:
-                    board[row_index][col_index] = "."
-
-        return ["".join(row) for row in board]
 
     def render_setup_groups(self, variants):
         self.output.delete("all")
@@ -2160,18 +1808,6 @@ class TetrisScannerApp:
             return
 
         if scan_target == "pc_solve":
-            active = (self.active_var.get() or "").strip().upper()
-            manual_see = (self.manual_see_var.get() or "").strip().upper()
-
-            if not result.get("current") and not active and not manual_see:
-                self.hydra_result_label.config(text="HYDRA: Current piece 대기 중")
-                self.print_message(
-                    "PC 해법을 찾으려면 current piece가 필요합니다.\n"
-                    "다음 CDP snapshot을 기다리거나 ACTIVE/SEE를 직접 입력해 주세요."
-                )
-                self.status_label.config(text=f"PC 해법 대기 - current 없음{round_text}")
-                return
-
             self.run_pc_solver_now(show_popup=False, force=True)
             return
 
@@ -2189,19 +1825,24 @@ class TetrisScannerApp:
     def _on_scan_finished(self):
         self.is_scanning = False
         if not self.is_closing:
-            self.set_scan_buttons_state("normal")
+            self.update_action_buttons_state()
             if self.auto_scan_enabled:
                 self.schedule_auto_scan()
 
-    def _run_pc_solver_worker(self, board, active_guess, hold, queue, active, manual_see, show_popup):
+    def _run_pc_solver_worker(self, board, active_piece, hold, queue, show_popup):
         try:
-            active_piece = active or active_guess or ""
+            queue_text = "".join(piece for piece in (queue or []) if piece)
+            print("[PC SOLVER] worker start")
+            print(
+                f"[PC SOLVER] request active={active_piece or '-'} "
+                f"hold={hold or '-'} queue={queue_text or '-'}"
+            )
             result = run_gomen_solver(
                 board=board,
                 active=active_piece,
                 hold=hold,
                 queue=queue,
-                manual_see=manual_see,
+                manual_see="",
                 limit=6,
                 timeout_sec=20,
             )
@@ -2212,132 +1853,55 @@ class TetrisScannerApp:
                 active=active_piece,
                 hold=hold,
             )
+            print(
+                f"[PC SOLVER] response ok={bool(result.get('ok'))} "
+                f"total={result.get('total')} shown_total={result.get('shown_total')} "
+                f"solutions={len(result.get('solutions') or [])}"
+            )
+            print(f"[PC SOLVER] render variants={len(result.get('variants') or [])}")
             self._post_to_ui(self._on_pc_solver_success, result)
         except GomenError as exc:
+            print(f"[PC SOLVER ERROR] {exc}")
+            traceback.print_exc()
             self._post_to_ui(self._on_pc_solver_error, str(exc), show_popup)
         except Exception as exc:
+            print(f"[PC SOLVER ERROR] {exc}")
+            traceback.print_exc()
             self._post_to_ui(self._on_pc_solver_error, str(exc), show_popup)
         finally:
+            print("[PC SOLVER] worker finished")
             self._post_to_ui(self._on_pc_solver_finished)
 
-    def _run_hydra_worker(self, board, active_guess, hold, queue, active, manual_see, bag_arg, show_popup):
-        try:
-            if active or manual_see:
-                primary_result = run_hydra_with_solution(
-                    board=board,
-                    active=active,
-                    hold=hold,
-                    queue=queue,
-                    manual_see=manual_see,
-                    bag_arg=bag_arg,
-                    threads=4,
-                    timeout_sec=60,
-                )
-                primary_result["active"] = active
-                primary_result["active_mode"] = "manual"
-                primary_result["candidates"] = []
-                primary_result["solution_variants"] = self._build_solution_variants(
-                    board=board,
-                    active=active,
-                    hold=hold,
-                    queue=queue,
-                    bag_arg=bag_arg,
-                    manual_see=manual_see,
-                    primary_result=primary_result,
-                )
-                result = primary_result
-            elif active_guess:
-                primary_result = run_hydra_with_solution(
-                    board=board,
-                    active=active_guess,
-                    hold=hold,
-                    queue=queue,
-                    manual_see="",
-                    bag_arg=bag_arg,
-                    threads=4,
-                    timeout_sec=60,
-                )
-                primary_result["active"] = active_guess
-                primary_result["active_mode"] = "board_guess"
-                primary_result["candidates"] = []
-                primary_result["solution_variants"] = self._build_solution_variants(
-                    board=board,
-                    active=active_guess,
-                    hold=hold,
-                    queue=queue,
-                    bag_arg=bag_arg,
-                    manual_see="",
-                    primary_result=primary_result,
-                )
-                result = primary_result
-            else:
-                result = run_hydra_auto_active(
-                    board=board,
-                    hold=hold,
-                    queue=queue,
-                    manual_see="",
-                    bag_arg=bag_arg,
-                    threads=4,
-                    timeout_sec=60,
-                )
-                if result.get("active"):
-                    primary_result = run_hydra_with_solution(
-                        board=board,
-                        active=result["active"],
-                        hold=hold,
-                        queue=queue,
-                        manual_see="",
-                        bag_arg=bag_arg,
-                        threads=4,
-                        timeout_sec=60,
-                    )
-                    result["solution"] = primary_result.get("solution")
-                    result["solution_variants"] = self._build_solution_variants(
-                        board=board,
-                        active=result["active"],
-                        hold=hold,
-                        queue=queue,
-                        bag_arg=bag_arg,
-                        manual_see="",
-                        primary_result=primary_result,
-                    )
-
-            self._post_to_ui(self._on_hydra_success, result)
-        except HydraError as exc:
-            self._post_to_ui(self._on_hydra_error, "hydra", str(exc), show_popup)
-        except Exception as exc:
-            self._post_to_ui(self._on_hydra_error, "generic", str(exc), show_popup)
-        finally:
-            self._post_to_ui(self._on_hydra_finished)
-
     def _on_pc_solver_success(self, result):
-        shown_total = int(result.get("shown_total") or result.get("total") or 0)
-        matched_total = int(result.get("matched_total") or 0)
-        exact_match_used = bool(result.get("exact_match_used"))
         variants = result.get("variants") or []
+        raw_total = int(result.get("total") or 0)
+        shown_total = int(result.get("shown_total") or raw_total or 0)
+        solutions = result.get("solutions") or []
         visible_total = len(variants[:6])
-        fast_text = "fast" if result.get("fast") else "normal"
-        queue_text = result.get("queue_text") or "-"
-        duration_ms = result.get("duration_ms", "?")
-        match_text = "exact" if exact_match_used else f"fallback({matched_total})"
-        self.hydra_result_label.config(
-            text=(
-                f"PC SOLVER: 표시 {visible_total}개 / 후보 {shown_total}개 | "
-                f"{duration_ms}ms | {fast_text} | {match_text} | queue={queue_text}"
-            )
+        print(
+            f"[PC SOLVER] success raw_total={raw_total} "
+            f"shown_total={shown_total} solutions={len(solutions)} variants={len(variants)}"
         )
 
         if variants:
+            self.pc_solver_status_var.set(f"PC SOLVER: 해법 {visible_total}개")
             self.render_pc_solution_groups(variants, solver_result=result)
             self.status_label.config(text="PC 해법 계산 완료")
             return
 
-        self.print_message("PC 해법은 찾았지만 카드로 표시할 수 있는 결과가 없습니다.")
-        self.status_label.config(text="PC 해법 카드 없음")
+        if solutions:
+            self.pc_solver_status_var.set("PC SOLVER 오류: 카드 변환 실패")
+            self.print_message("PC 해법은 찾았지만 카드 변환에 실패했습니다.")
+            self.status_label.config(text="PC 해법 카드 변환 실패")
+            return
+
+        self.pc_solver_status_var.set("PC SOLVER: 해법 없음")
+        self.print_message("PC 해법 없음")
+        self.status_label.config(text="PC 해법 없음")
 
     def _on_pc_solver_error(self, error_text, show_popup):
         headline = error_text.splitlines()[0] if error_text else "알 수 없는 오류"
-        self.hydra_result_label.config(text=f"PC SOLVER 오류: {headline}")
+        self.pc_solver_status_var.set(f"PC SOLVER 오류: {headline}")
         self.status_label.config(text="PC 해법 계산 실패")
         self.print_message("PC 해법 계산에 실패했습니다.")
 
@@ -2346,148 +1910,8 @@ class TetrisScannerApp:
 
     def _on_pc_solver_finished(self):
         self.is_pc_solving = False
-
-    def _build_solution_variants(self, board, active, hold, queue, bag_arg, manual_see, primary_result):
-        variants = []
-        seen = set()
-
-        primary_solution = primary_result.get("solution")
-        primary_key = self._solution_key(primary_solution)
-        if primary_solution and primary_key:
-            variants.append(
-                {
-                    "title": self.make_solution_title(
-                        index=1,
-                        solution=primary_solution,
-                        active=active,
-                        hold=hold,
-                    ),
-                    "solution": primary_solution,
-                }
-            )
-            seen.add(primary_key)
-
-        if (not self.enable_hold_solution_variant) or manual_see or not hold or not active or hold == active:
-            return variants
-
-        try:
-            alt_result = run_hydra_with_solution(
-                board=board,
-                active=hold,
-                hold=active,
-                queue=queue,
-                manual_see="",
-                bag_arg=bag_arg,
-                threads=4,
-                timeout_sec=60,
-            )
-            alt_solution = alt_result.get("solution")
-            alt_key = self._solution_key(alt_solution)
-            if alt_solution and alt_key and alt_key not in seen:
-                variants.append(
-                    {
-                        "title": self.make_solution_title(
-                            index=len(variants) + 1,
-                            solution=alt_solution,
-                            active=hold,
-                            hold=active,
-                        ),
-                        "solution": alt_solution,
-                    }
-                )
-                seen.add(alt_key)
-        except HydraError:
-            pass
-
-        return variants
-
-    def make_solution_title(self, index, solution, active, hold):
-        pieces = solution.get("pieces") or []
-        first_piece = pieces[0] if pieces else ""
-
-        if first_piece and hold and first_piece == hold and hold != active:
-            return f"{index}. HOLD {hold}"
-        if first_piece and active and first_piece == active:
-            return f"{index}. ACTIVE {active}"
-        if first_piece:
-            return f"{index}. START {first_piece}"
-        if active:
-            return f"{index}. ACTIVE {active}"
-        return f"{index}. SOLVE"
-
-    def _solution_key(self, solution):
-        if not solution:
-            return None
-        pieces = tuple(solution.get("pieces") or [])
-        steps = tuple(step.get("hash") for step in solution.get("steps") or [])
-        return pieces, steps
-
-    def _on_hydra_success(self, result):
-        if result["total"]:
-            percent_text = f"{result['percent']:.2f}%" if result["percent"] is not None else "?"
-            label = (
-                f"HYDRA: {result['success']}/{result['total']} "
-                f"({percent_text}) | {result['time_ms']}ms | "
-                f"hash={result['field_hash']} | see={result['see']} bag={result['bag_arg']}"
-            )
-        else:
-            label = (
-                f"HYDRA: {result['success']} | {result['time_ms']}ms | "
-                f"hash={result['field_hash']} | see={result['see']} bag={result['bag_arg']}"
-            )
-
-        if result.get("active_mode") == "auto_active":
-            top_candidates = ", ".join(
-                candidate["active"]
-                for candidate in result.get("candidates", [])
-            )
-            if top_candidates:
-                label += f" | active={result['active']} [{top_candidates}]"
-            else:
-                label += f" | active={result['active']}"
-        elif result.get("active_mode") == "board_guess":
-            label += f" | active~{result['active']}"
-        elif result.get("active"):
-            label += f" | active={result['active']}"
-
-        self.hydra_result_label.config(text=label)
-        self.status_label.config(text="Hydra 해법 계산 완료")
-
-        variants = result.get("solution_variants") or []
-        if variants:
-            self.render_solution_groups(variants, hydra_result=result)
-            return
-
-        solution = result.get("solution")
-        if solution and solution.get("pieces"):
-            active = result.get("active") or ""
-            hold = (self.last_result or {}).get("hold") or ""
-            self.render_solution_groups(
-                [{
-                    "title": self.make_solution_title(1, solution, active=active, hold=hold),
-                    "solution": solution,
-                }],
-                hydra_result=result,
-            )
-        else:
-            self.print_message("Hydra 결과는 나왔지만 카드형 해법 데이터는 찾지 못했습니다.")
-
-    def _on_hydra_error(self, error_kind, error_text, show_popup):
-        headline = error_text.splitlines()[0] if error_text else "알 수 없는 오류"
-        self.hydra_result_label.config(text=f"HYDRA 오류: {headline}")
-        self.status_label.config(text="Hydra 계산 실패")
-        if error_kind == "hydra":
-            self.print_message("Hydra 계산에 실패했습니다.")
-        else:
-            self.print_message("Hydra 계산 중 예외가 발생했습니다.")
-
-        if show_popup:
-            messagebox.showerror("Hydra 오류", error_text)
-
-    def _on_hydra_finished(self):
-        self.is_hydra_running = False
         if not self.is_closing:
-            self.hydra_button.config(state="normal")
+            self.update_action_buttons_state()
 
     def _make_scan_signature(self, result):
         board = tuple("".join(row) for row in result.get("board", []))
@@ -2501,32 +1925,24 @@ class TetrisScannerApp:
             result.get("pc_round"),
         )
 
-    def _hydra_warmup_worker(self):
-        try:
-            warm_hydra_session(decision_mode=True, threads=4, timeout_sec=60)
-            self._post_to_ui(self._on_hydra_warmup_success)
-        except Exception:
-            self._post_to_ui(self._on_hydra_warmup_finished)
-
     def _pc_solver_warmup_worker(self):
         try:
             warm_gomen_session(timeout_sec=30)
             self._post_to_ui(self._on_pc_solver_warmup_success)
-        except Exception:
-            self._post_to_ui(self._on_pc_solver_warmup_finished)
-
-    def _on_hydra_warmup_success(self):
-        self.hydra_warm_ready = True
-        current_text = self.hydra_result_label.cget("text")
-        if not self.is_hydra_running and not str(current_text).startswith("PC SOLVER"):
-            self.hydra_result_label.config(text="HYDRA: 대기 중")
-        self._on_hydra_warmup_finished()
-
-    def _on_hydra_warmup_finished(self):
-        self.is_hydra_warming = False
+        except Exception as exc:
+            print(f"[PC SOLVER ERROR] warmup failed: {exc}")
+            traceback.print_exc()
+            self._post_to_ui(self._on_pc_solver_warmup_error, str(exc))
 
     def _on_pc_solver_warmup_success(self):
         self.pc_solver_warm_ready = True
+        self.pc_solver_status_var.set("PC SOLVER: 대기 중")
+        self._on_pc_solver_warmup_finished()
+
+    def _on_pc_solver_warmup_error(self, error_text):
+        headline = (error_text or "알 수 없는 오류").splitlines()[0]
+        self.pc_solver_warm_ready = False
+        self.pc_solver_status_var.set(f"PC SOLVER 오류: {headline}")
         self._on_pc_solver_warmup_finished()
 
     def _on_pc_solver_warmup_finished(self):

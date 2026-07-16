@@ -1,8 +1,10 @@
+import os
+import shutil
 import threading
 import unittest
 from unittest import mock
 
-from gomen_helper import GomenSession
+from gomen_helper import GomenSession, get_gomen_solver_path, get_node_executable
 
 
 class FakeProcess:
@@ -119,6 +121,74 @@ class GomenSessionTests(unittest.TestCase):
 
         self.assertEqual(print_mock.call_count, 0)
         self.assertEqual(session.last_reader_warning, "")
+
+
+def has_node_runtime():
+    executable = get_node_executable()
+    if os.path.isabs(executable):
+        return os.path.exists(executable)
+    return shutil.which(executable) is not None
+
+
+@unittest.skipUnless(
+    os.path.exists(get_gomen_solver_path()) and has_node_runtime(),
+    "node runtime or gomen solver assets are unavailable",
+)
+class GomenSessionIntegrationTests(unittest.TestCase):
+    def test_real_solver_handles_two_requests_on_same_process(self):
+        session = GomenSession()
+        try:
+            response1 = session.solve(
+                queue_text="TIJLOSZ",
+                garbage=0,
+                timeout_sec=30,
+                target_queue="TIJLOSZ",
+            )
+            first_proc = session.proc
+
+            self.assertIsNotNone(first_proc)
+            self.assertIsNone(first_proc.poll())
+            self.assertTrue(response1["ok"])
+            self.assertIn("solutions", response1)
+
+            response2 = session.solve(
+                queue_text="TIJLOSZ",
+                garbage=0,
+                timeout_sec=30,
+                target_queue="TIJLOSZ",
+            )
+
+            self.assertTrue(response2["ok"])
+            self.assertIs(session.proc, first_proc)
+            self.assertIsNone(first_proc.poll())
+        finally:
+            session.close()
+
+    def test_next_solve_restarts_after_forced_process_exit(self):
+        session = GomenSession()
+        try:
+            session.ensure_started(timeout_sec=30)
+            first_proc = session.proc
+
+            self.assertIsNotNone(first_proc)
+            first_proc.kill()
+            first_proc.wait(timeout=5)
+
+            if session.reader_thread is not None:
+                session.reader_thread.join(timeout=5)
+
+            response = session.solve(
+                queue_text="TIJLOSZ",
+                garbage=0,
+                timeout_sec=30,
+                target_queue="TIJLOSZ",
+            )
+
+            self.assertTrue(response["ok"])
+            self.assertIsNotNone(session.proc)
+            self.assertIsNot(session.proc, first_proc)
+        finally:
+            session.close()
 
 
 if __name__ == "__main__":

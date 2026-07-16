@@ -1,7 +1,11 @@
-const fs = require("fs");
-const path = require("path");
-const readline = require("readline");
-const vm = require("vm");
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+import vm from "node:vm";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 function loadRuntime() {
   const scriptPath = path.join(__dirname, "gomen.js");
@@ -146,7 +150,7 @@ function main() {
     crlfDelay: Infinity,
   });
 
-  process.stdout.write(JSON.stringify({ kind: "ready" }) + "\n");
+  process.stdout.write(`${JSON.stringify({ kind: "ready" })}\n`);
 
   rl.on("line", (line) => {
     const text = String(line || "").trim();
@@ -157,13 +161,13 @@ function main() {
     try {
       const request = JSON.parse(text);
       const result = solve(runtime, request);
-      process.stdout.write(JSON.stringify(result) + "\n");
+      process.stdout.write(`${JSON.stringify(result)}\n`);
     } catch (error) {
       process.stdout.write(
-        JSON.stringify({
+        `${JSON.stringify({
           ok: false,
           error: error && error.message ? error.message : String(error),
-        }) + "\n"
+        })}\n`
       );
     }
   });
