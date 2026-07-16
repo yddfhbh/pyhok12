@@ -787,7 +787,23 @@ class TetrisScannerApp:
         if self.is_closing:
             return
 
-        status = self.state_source.get_status()
+        try:
+            status = self.state_source.get_status()
+        except Exception as exc:
+            status = {
+                "browser_status": "Error",
+                "game_state": "Waiting",
+                "mode": "Unknown",
+                "game_id": "",
+                "round_id": "",
+                "piece_counter": None,
+                "board_size": "-",
+                "current": "-",
+                "hold": "-",
+                "queue": "-",
+                "last_update_age_ms": None,
+                "detail": str(exc),
+            }
         identity = status.get("round_id") or status.get("game_id") or "-"
         age_ms = status.get("last_update_age_ms")
         age_text = "-" if age_ms is None else f"{age_ms}ms"

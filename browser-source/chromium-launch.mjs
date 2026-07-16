@@ -42,10 +42,13 @@ export function launchChromium({
   }
   const resolvedProfileDir = profileDir || path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}`);
   mkdirSync(resolvedProfileDir, { recursive: true });
-  return spawnImpl(executable, buildChromeArgs({ port, url, profileDir: resolvedProfileDir }), {
-    detached: false,
+  const browserProcess = spawnImpl(executable, buildChromeArgs({ port, url, profileDir: resolvedProfileDir }), {
+    detached: true,
     stdio: ["ignore", "ignore", "ignore"]
   });
+  // Keep the debugging browser alive even if the helper process restarts.
+  browserProcess.unref();
+  return browserProcess;
 }
 
 export async function isCdpOpen(port, fetchImpl = fetch) {

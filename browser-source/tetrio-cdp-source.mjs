@@ -136,6 +136,111 @@ export function buildIdentityToken(identity, pieceCounter) {
   return `${identity}:${pieceCounter}`;
 }
 
+export function createSessionState() {
+  return {
+    sessionSerial: 0,
+    currentSessionId: null,
+    lastPlaying: false,
+    lastRoundId: "",
+    lastGameId: "",
+    lastGameObjectId: "",
+    lastPieceCounterSource: "",
+    seenGameSinceReset: false
+  };
+}
+
+export function resetSessionState(sessionState) {
+  sessionState.currentSessionId = null;
+  sessionState.lastPlaying = false;
+  sessionState.lastRoundId = "";
+  sessionState.lastGameId = "";
+  sessionState.lastGameObjectId = "";
+  sessionState.lastPieceCounterSource = "";
+  sessionState.seenGameSinceReset = false;
+  return sessionState;
+}
+
+export function updateSessionState(
+  sessionState,
+  { playing, roundId = "", gameId = "", gameObjectId = "" }
+) {
+  if (!playing) {
+    resetSessionState(sessionState);
+    return null;
+  }
+
+  const normalizedRoundId = String(roundId ?? "");
+  const normalizedGameId = String(gameId ?? "");
+  const normalizedGameObjectId = String(gameObjectId ?? "");
+
+  const newSession =
+    !sessionState.lastPlaying ||
+    !sessionState.currentSessionId ||
+    (normalizedGameObjectId &&
+      sessionState.lastGameObjectId &&
+      normalizedGameObjectId !== sessionState.lastGameObjectId) ||
+    (normalizedRoundId &&
+      sessionState.lastRoundId &&
+      normalizedRoundId !== sessionState.lastRoundId) ||
+    (normalizedGameId &&
+      sessionState.lastGameId &&
+      normalizedGameId !== sessionState.lastGameId) ||
+    (!sessionState.seenGameSinceReset &&
+      Boolean(normalizedGameObjectId || normalizedRoundId || normalizedGameId));
+
+  if (newSession) {
+    sessionState.sessionSerial += 1;
+    sessionState.currentSessionId = `session-${sessionState.sessionSerial}`;
+    sessionState.lastPieceCounterSource = "";
+  }
+
+  sessionState.lastPlaying = true;
+  sessionState.lastRoundId = normalizedRoundId;
+  sessionState.lastGameId = normalizedGameId;
+  sessionState.lastGameObjectId = normalizedGameObjectId;
+  sessionState.seenGameSinceReset = true;
+  return sessionState.currentSessionId;
+}
+
+export function acceptPieceCounterSource(sessionState, source) {
+  const normalizedSource = String(source ?? "");
+  if (!normalizedSource) {
+    return false;
+  }
+  if (!sessionState.lastPieceCounterSource) {
+    sessionState.lastPieceCounterSource = normalizedSource;
+    return true;
+  }
+  return sessionState.lastPieceCounterSource === normalizedSource;
+}
+
+export function buildTombstoneSnapshot({
+  source = "browser_cdp",
+  mode = "Unknown",
+  reason = "Waiting for game state",
+  capturedAt = Date.now()
+} = {}) {
+  return {
+    ok: false,
+    source,
+    mode,
+    reason,
+    ready: false,
+    playing: false,
+    sessionId: null,
+    gameId: null,
+    roundId: null,
+    board: null,
+    current: null,
+    hold: null,
+    queue: [],
+    pieceCounter: null,
+    pieceCounterSource: null,
+    token: null,
+    capturedAt
+  };
+}
+
 export function normalizeVisibleBoardFromBottomUpField(field) {
   if (!Array.isArray(field)) {
     return [];
@@ -267,6 +372,30 @@ export function clearSnapshotFile(snapshotPath) {
   rmSync(snapshotPath, { force: true });
 }
 
+export function writeTombstoneSnapshot(snapshotPath, tracking, options = {}) {
+  const tombstone = buildTombstoneSnapshot(options);
+  const signature = `tombstone|${tombstone.mode}|${tombstone.reason}|${tombstone.source}`;
+  if (tracking?.lastWrittenSignature === signature) {
+    return tombstone;
+  }
+  writeSnapshot(snapshotPath, tombstone);
+  if (tracking) {
+    tracking.lastWrittenSignature = signature;
+    tracking.lastLoggedToken = "";
+  }
+  return tombstone;
+}
+
+function isFatalCdpError(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("cdp socket is not open") ||
+    message.includes("websocket is not open") ||
+    message.includes("target closed") ||
+    message.includes("inspected target navigated or closed")
+  );
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
@@ -386,6 +515,7 @@ async function main() {
   let lastReasonAt = 0;
   const snapshotTracking = createSnapshotTracking();
   const vsObjectTracking = createVsObjectTracking();
+  const sessionState = createSessionState();
   const probeState = {
     lastCaptureAt: 0
   };
@@ -407,213 +537,291 @@ async function main() {
   process.on("SIGTERM", () => stop().finally(() => process.exit(0)));
 
   while (true) {
-    const loopNow = Date.now();
-    maxEventLoopDelayMs = Math.max(
-      maxEventLoopDelayMs,
-      Math.max(0, loopNow - (loopStartedAt + pollMs))
-    );
-    loopStartedAt = loopNow;
+    try {
+      const loopNow = Date.now();
+      maxEventLoopDelayMs = Math.max(
+        maxEventLoopDelayMs,
+        Math.max(0, loopNow - (loopStartedAt + pollMs))
+      );
+      loopStartedAt = loopNow;
 
-    if (vsRoundStatus.active) {
-      if (vsObjectTracking.lastActiveRoundId !== vsRoundStatus.roundId) {
-        if (vsObjectTracking.lastActiveRoundId) {
-          clearVsScopeSchedule(vsObjectTracking, "round_changed", (message) => console.log(message));
+      if (vsRoundStatus.active) {
+        if (vsObjectTracking.lastActiveRoundId !== vsRoundStatus.roundId) {
+          if (vsObjectTracking.lastActiveRoundId) {
+            clearVsScopeSchedule(vsObjectTracking, "round_changed", (message) => console.log(message));
+          }
+          vsObjectTracking.lastActiveRoundId = vsRoundStatus.roundId;
+          resetSnapshotTracking(snapshotTracking);
+          resetSessionState(sessionState);
+          probeState.lastCaptureAt = 0;
+          writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+            mode: "VS",
+            reason: "VS round changed"
+          });
         }
-        vsObjectTracking.lastActiveRoundId = vsRoundStatus.roundId;
-        resetSnapshotTracking(snapshotTracking);
-        probeState.lastCaptureAt = 0;
-        clearSnapshotFile(snapshotPath);
+
+        await processVsObjectDiagnostics(cdp, {
+          vsRoundStatus,
+          tracking: vsObjectTracking,
+          sessionState,
+          liveSnapshotPath: snapshotPath,
+          snapshotTracking,
+          vsObjectSnapshotPath,
+          traceEnabled: vsObjectTraceEnabled,
+          scopeTraceEnabled: vsScopeTraceEnabled,
+          getVsRoundStatus: () => vsRoundStatus
+        });
+
+        lastReason = "";
+        lastReasonAt = 0;
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
       }
 
-      await processVsObjectDiagnostics(cdp, {
-        vsRoundStatus,
-        tracking: vsObjectTracking,
-        liveSnapshotPath: snapshotPath,
-        vsObjectSnapshotPath,
-        traceEnabled: vsObjectTraceEnabled,
-        scopeTraceEnabled: vsScopeTraceEnabled,
-        getVsRoundStatus: () => vsRoundStatus
+      if (vsObjectTracking.lastActiveRoundId) {
+        clearVsScopeSchedule(vsObjectTracking, "inactive", (message) => console.log(message));
+        resetVsObjectTracking(vsObjectTracking);
+        resetSnapshotTracking(snapshotTracking);
+        resetSessionState(sessionState);
+        writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+          mode: "VS",
+          reason: "VS round inactive"
+        });
+        writeSnapshot(vsObjectSnapshotPath, buildTombstoneSnapshot({
+          source: "vs_object",
+          mode: "VS",
+          reason: "VS round inactive"
+        }));
+        probeState.lastCaptureAt = 0;
+      }
+
+      const state = await readTetrioState(cdp, {
+        probePageState,
+        useSeedSimulationFallback,
+        network,
+        probeState,
+        suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
+        suppressedReason: DEFAULT_SUPPRESSED_REASON,
+        perfEnabled: browserPerfEnabled
       });
+
+      if (shouldHandleEndedGame(state, endedHandled)) {
+        endedHandled = true;
+        waitingForNextGame = true;
+
+        await markCurrentGameAsEnded(cdp);
+
+        resetSnapshotTracking(snapshotTracking);
+        resetSessionState(sessionState);
+        probeState.lastCaptureAt = 0;
+        writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+          mode: "Solo",
+          reason: "TETR.IO game ended"
+        });
+
+        console.log(`[browser] game session ended epoch=${gameEpoch}`);
+        console.log("[browser] wrote ended-game tombstone; waiting for next game");
+      }
+
+      if (isTetrioGameEndedState(state)) {
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
+      }
+
+      if (!state.ok || !state.ready || !state.playing || state.countdown) {
+        const reason =
+          state.reason ??
+          (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
+        const now = Date.now();
+        if (shouldLogStateReason({
+          reason,
+          lastReason,
+          lastReasonAt,
+          now,
+          suppressRepeatedReason: state.reason === DEFAULT_SUPPRESSED_REASON
+        })) {
+          console.log(`[browser] ${reason}`);
+          lastReason = reason;
+          lastReasonAt = now;
+        }
+        resetSnapshotTracking(snapshotTracking);
+        resetSessionState(sessionState);
+        writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+          mode: "Solo",
+          reason
+        });
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
+      }
+
+      if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
+        gameEpoch += 1;
+        waitingForNextGame = false;
+        endedHandled = false;
+        resetSnapshotTracking(snapshotTracking);
+        console.log(`[browser] new game detected epoch=${gameEpoch}`);
+      }
+
+      const sessionId = updateSessionState(sessionState, {
+        playing: state.playing,
+        roundId: state.roundId ?? "",
+        gameId: state.gameId ?? "",
+        gameObjectId: state.gameObjectId ?? ""
+      });
+      if (!sessionId) {
+        writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+          mode: "Solo",
+          reason: "session unavailable"
+        });
+        await sleep(pollMs);
+        continue;
+      }
+
+      if (!acceptPieceCounterSource(sessionState, state.pieceCounterSource)) {
+        console.log("[browser] pieceCounter source changed inside one session; recapturing game object");
+        await markCurrentGameAsEnded(cdp);
+        resetSnapshotTracking(snapshotTracking);
+        resetSessionState(sessionState);
+        probeState.lastCaptureAt = 0;
+        writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+          mode: "Solo",
+          reason: "pieceCounter source changed"
+        });
+        await sleep(pollMs);
+        continue;
+      }
 
       lastReason = "";
       lastReasonAt = 0;
-      const perfUpdate = maybeLogBrowserPerf({
-        browserPerfEnabled,
-        lastPerfLoggedAt,
-        maxEventLoopDelayMs
-      });
-      if (perfUpdate) {
-        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+
+      const pieceKey = `${sessionId}:${state.pieceCounter}`;
+      if (pieceKey !== snapshotTracking.pendingPieceKey) {
+        snapshotTracking.pendingPieceKey = pieceKey;
+        snapshotTracking.pendingPieceDetectedAt = Date.now();
       }
-      await sleep(pollMs);
-      continue;
-    }
 
-    if (vsObjectTracking.lastActiveRoundId) {
-      clearVsScopeSchedule(vsObjectTracking, "inactive", (message) => console.log(message));
-      resetVsObjectTracking(vsObjectTracking);
-      clearSnapshotFile(vsObjectSnapshotPath);
-      clearSnapshotFile(snapshotPath);
-      resetSnapshotTracking(snapshotTracking);
-      probeState.lastCaptureAt = 0;
-    }
-
-    const state = await readTetrioState(cdp, {
-      probePageState,
-      useSeedSimulationFallback,
-      network,
-      probeState,
-      suppressClosureCapture: vsWsSimEnabled && vsRoundActive,
-      suppressedReason: DEFAULT_SUPPRESSED_REASON,
-      perfEnabled: browserPerfEnabled
-    });
-
-    if (shouldHandleEndedGame(state, endedHandled)) {
-      endedHandled = true;
-      waitingForNextGame = true;
-
-      await markCurrentGameAsEnded(cdp);
-
-      resetSnapshotTracking(snapshotTracking);
-      probeState.lastCaptureAt = 0;
-      clearSnapshotFile(snapshotPath);
-
-      console.log(`[browser] game session ended epoch=${gameEpoch}`);
-      console.log("[browser] cleared ended game cache; waiting for next game");
-    }
-
-    if (isTetrioGameEndedState(state)) {
-      const perfUpdate = maybeLogBrowserPerf({
-        browserPerfEnabled,
-        lastPerfLoggedAt,
-        maxEventLoopDelayMs
-      });
-      if (perfUpdate) {
-        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+      const signature = buildSnapshotSignature(sessionId, state);
+      if (signature === snapshotTracking.stableSignature) {
+        snapshotTracking.stableCount += 1;
+      } else {
+        snapshotTracking.stableSignature = signature;
+        snapshotTracking.stableCount = 1;
       }
-      await sleep(pollMs);
-      continue;
-    }
 
-    if (!state.ok || !state.ready || !state.playing || state.countdown) {
-      const reason =
-        state.reason ??
-        (!state.playing ? "page is not playing" : state.countdown ? "countdown active" : "state not ready");
-      const now = Date.now();
-      if (shouldLogStateReason({
-        reason,
-        lastReason,
-        lastReasonAt,
-        now,
-        suppressRepeatedReason: state.reason === DEFAULT_SUPPRESSED_REASON
-      })) {
-        console.log(`[browser] ${reason}`);
-        lastReason = reason;
-        lastReasonAt = now;
+      if (snapshotTracking.stableCount < 2) {
+        await sleep(pollMs);
+        continue;
       }
-      const perfUpdate = maybeLogBrowserPerf({
-        browserPerfEnabled,
-        lastPerfLoggedAt,
-        maxEventLoopDelayMs
-      });
-      if (perfUpdate) {
-        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
-      }
-      await sleep(pollMs);
-      continue;
-    }
 
-    if (shouldAdvanceGameEpoch(state, waitingForNextGame)) {
-      gameEpoch += 1;
-      waitingForNextGame = false;
-      endedHandled = false;
-      resetSnapshotTracking(snapshotTracking);
-      console.log(`[browser] new game detected epoch=${gameEpoch}`);
-    }
+      const snapshot = {
+        ok: true,
+        source: "browser_cdp",
+        mode: "Solo",
+        ready: Boolean(state.ready),
+        playing: Boolean(state.playing),
+        sessionId,
+        gameId: state.gameId ?? null,
+        roundId: state.roundId ?? null,
+        board: normalizeVisibleBoardFromBottomUpField(state.field),
+        field: state.field,
+        current: state.current.toUpperCase(),
+        hold: state.hold ? state.hold.toUpperCase() : null,
+        queue: state.queue.map((piece) => piece.toUpperCase()),
+        b2b: Boolean(state.b2b),
+        combo: state.combo,
+        incoming: state.incoming,
+        pieceCounter: state.pieceCounter,
+        pieceCounterSource: state.pieceCounterSource,
+        token: buildIdentityToken(sessionId, state.pieceCounter),
+        countdown: state.countdown,
+        capturedAt: Date.now(),
+        activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
+        activeY: Number.isFinite(state.activeY) ? state.activeY : undefined,
+        activeRotation: state.activeRotation ?? undefined
+      };
 
-    lastReason = "";
-    lastReasonAt = 0;
-
-    const pieceKey = `${gameEpoch}:${state.pieceCounter}`;
-    if (pieceKey !== snapshotTracking.pendingPieceKey) {
-      snapshotTracking.pendingPieceKey = pieceKey;
-      snapshotTracking.pendingPieceDetectedAt = Date.now();
-    }
-
-    const signature = buildSnapshotSignature(gameEpoch, state);
-    if (signature === snapshotTracking.stableSignature) {
-      snapshotTracking.stableCount += 1;
-    } else {
-      snapshotTracking.stableSignature = signature;
-      snapshotTracking.stableCount = 1;
-    }
-
-    if (snapshotTracking.stableCount < 2) {
-      await sleep(pollMs);
-      continue;
-    }
-
-    const snapshot = {
-      ok: true,
-      source: "browser_cdp",
-      mode: "Solo",
-      ready: Boolean(state.ready),
-      gameId: `solo-${gameEpoch}`,
-      roundId: null,
-      board: normalizeVisibleBoardFromBottomUpField(state.field),
-      field: state.field,
-      current: state.current.toUpperCase(),
-      hold: state.hold ? state.hold.toUpperCase() : null,
-      queue: state.queue.map((piece) => piece.toUpperCase()),
-      b2b: Boolean(state.b2b),
-      combo: state.combo,
-      incoming: state.incoming,
-      pieceCounter: state.pieceCounter,
-      token: buildIdentityToken(`solo-${gameEpoch}`, state.pieceCounter),
-      playing: state.playing,
-      countdown: state.countdown,
-      capturedAt: Date.now(),
-      activeX: Number.isFinite(state.activeX) ? state.activeX : undefined,
-      activeY: Number.isFinite(state.activeY) ? state.activeY : undefined,
-      activeRotation: state.activeRotation ?? undefined
-    };
-
-    if (signature !== snapshotTracking.lastWrittenSignature) {
-      writeSnapshot(snapshotPath, snapshot);
-      snapshotTracking.lastWrittenSignature = signature;
-      if (
-        pieceKey === snapshotTracking.pendingPieceKey &&
-        pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
-      ) {
-        snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
-        if (browserPerfEnabled) {
+      if (signature !== snapshotTracking.lastWrittenSignature) {
+        writeSnapshot(snapshotPath, snapshot);
+        snapshotTracking.lastWrittenSignature = signature;
+        if (
+          pieceKey === snapshotTracking.pendingPieceKey &&
+          pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
+        ) {
+          snapshotTracking.lastPerfLoggedPieceKey = pieceKey;
+          if (browserPerfEnabled) {
+            console.log(
+              `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+            );
+          }
+        }
+        if (snapshot.token !== snapshotTracking.lastLoggedToken) {
+          snapshotTracking.lastLoggedToken = snapshot.token;
           console.log(
-            `[browser-perf] piece_change_to_snapshot_ms=${Math.max(0, Date.now() - snapshotTracking.pendingPieceDetectedAt)}`
+            `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
           );
         }
       }
-      if (snapshot.token !== snapshotTracking.lastLoggedToken) {
-        snapshotTracking.lastLoggedToken = snapshot.token;
-        console.log(
-          `[browser] page state ready pieceCounter=${state.pieceCounter} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
-        );
+
+      const perfUpdate = maybeLogBrowserPerf({
+        browserPerfEnabled,
+        lastPerfLoggedAt,
+        maxEventLoopDelayMs
+      });
+      if (perfUpdate) {
+        lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+        maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
       }
-    }
 
-    const perfUpdate = maybeLogBrowserPerf({
-      browserPerfEnabled,
-      lastPerfLoggedAt,
-      maxEventLoopDelayMs
-    });
-    if (perfUpdate) {
-      lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
-      maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+      await sleep(pollMs);
+    } catch (error) {
+      const fatal = isFatalCdpError(error);
+      if (shouldLogStateReason({
+        reason: `poll error: ${error?.message ?? String(error)}`,
+        lastReason,
+        lastReasonAt
+      })) {
+        console.log(`[browser] poll error: ${error?.message ?? String(error)}`);
+        lastReason = `poll error: ${error?.message ?? String(error)}`;
+        lastReasonAt = Date.now();
+      }
+      resetSnapshotTracking(snapshotTracking);
+      resetSessionState(sessionState);
+      writeTombstoneSnapshot(snapshotPath, snapshotTracking, {
+        mode: vsRoundStatus.active ? "VS" : "Solo",
+        reason: fatal ? "CDP disconnected" : "poll error"
+      });
+      if (fatal) {
+        throw error;
+      }
+      await sleep(pollMs);
     }
-
-    await sleep(pollMs);
   }
 }
 
@@ -626,6 +834,7 @@ async function markCurrentGameAsEnded(cdp) {
 
       delete window.__fusionTetrioGame;
       delete window.__fusionTetrioBridge;
+      delete window.__fusionVsObjectCache;
 
       return true;
     })()`,
@@ -993,18 +1202,21 @@ function isVsRoundStillActive(roundId, getVsRoundStatus) {
   return Boolean(status?.active) && String(status?.roundId ?? "") === String(roundId ?? "");
 }
 
-function buildVsObjectSnapshot(candidate, vsRoundStatus, source) {
+function buildVsObjectSnapshot(candidate, vsRoundStatus, source, sessionId) {
   const roundId = String(vsRoundStatus?.roundId ?? candidate?.roundId ?? "");
   const gameId = String(candidate?.gameid ?? vsRoundStatus?.localGameId ?? "");
   const pieceCounter = normalizePieceCounter(candidate?.pieceCounter);
   return {
+    ok: true,
     mode: "VS",
     ready: true,
     playing: Boolean(candidate?.active),
+    sessionId,
     roundId,
     gameId,
     localGameId: String(vsRoundStatus?.localGameId ?? candidate?.gameid ?? ""),
     gameid: gameId,
+    gameObjectId: String(candidate?.gameObjectId ?? ""),
     board: normalizeVisibleBoardFromTopDownBoard(candidate?.board ?? []),
     current: candidate?.current ? String(candidate.current).toUpperCase() : null,
     hold: candidate?.hold ? String(candidate.hold).toUpperCase() : null,
@@ -1012,11 +1224,40 @@ function buildVsObjectSnapshot(candidate, vsRoundStatus, source) {
       ? candidate.queue.map((piece) => String(piece).toUpperCase())
       : [],
     pieceCounter,
-    token: buildIdentityToken(roundId || gameId || "vs", pieceCounter),
+    pieceCounterSource: String(candidate?.pieceCounterSource ?? source ?? "vs_object"),
+    token: buildIdentityToken(sessionId || roundId || gameId || "vs", pieceCounter),
     active: Boolean(candidate?.active),
     capturedAt: candidate?.capturedAt ?? Date.now(),
     source
   };
+}
+
+function writeVsTombstones({
+  liveSnapshotPath,
+  vsObjectSnapshotPath,
+  snapshotTracking,
+  tracking,
+  reason
+}) {
+  writeTombstoneSnapshot(liveSnapshotPath, snapshotTracking, {
+    mode: "VS",
+    reason
+  });
+  const signature = `tombstone|VS|${reason}`;
+  if (tracking?.lastSnapshotSignature !== signature) {
+    writeSnapshot(
+      vsObjectSnapshotPath,
+      buildTombstoneSnapshot({
+        source: "vs_object",
+        mode: "VS",
+        reason
+      })
+    );
+    if (tracking) {
+      tracking.lastSnapshotSignature = signature;
+      tracking.lastCandidateLogSignature = "";
+    }
+  }
 }
 
 function logVsScopeCandidate(candidate, roundId, log = (message) => console.log(message)) {
@@ -1494,14 +1735,35 @@ function readRemoteInteger(remoteValue) {
   return Number.isFinite(parsed) ? Math.floor(parsed) : null;
 }
 
+function isValidPieceCounterValue(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function buildPieceCounterCandidate(source, value) {
+  return isValidPieceCounterValue(value)
+    ? {
+        value,
+        source
+      }
+    : null;
+}
+
 async function extractRemotePieceCounter(cdp, propertyMap, context) {
-  for (const key of ["pieceCounter", "piececount", "piecesplaced", "piecesPlaced", "pieces"]) {
+  const directCandidates = [
+    ["pieceCounter", "pieceCounter"],
+    ["piecesPlaced", "piecesPlaced"],
+    ["piecesplaced", "piecesplaced"],
+    ["piececount", "piececount"],
+    ["pieces", "pieces"]
+  ];
+  for (const [key, source] of directCandidates) {
     if (!propertyMap.has(key)) {
       continue;
     }
     const directValue = readRemoteInteger(propertyMap.get(key));
-    if (directValue !== null && directValue >= 0) {
-      return directValue;
+    const candidate = buildPieceCounterCandidate(source, directValue);
+    if (candidate) {
+      return candidate;
     }
   }
 
@@ -1516,13 +1778,21 @@ async function extractRemotePieceCounter(cdp, propertyMap, context) {
 
   const statsProperties = await getRemoteProperties(cdp, statsValue, context);
   const statsMap = propertiesToMap(statsProperties);
-  for (const key of ["pieceCounter", "piececount", "piecesplaced", "piecesPlaced", "pieces"]) {
+  const statsCandidates = [
+    ["pieceCounter", "stats.pieceCounter"],
+    ["piecesPlaced", "stats.piecesPlaced"],
+    ["piecesplaced", "stats.piecesplaced"],
+    ["piececount", "stats.piececount"],
+    ["pieces", "stats.pieces"]
+  ];
+  for (const [key, source] of statsCandidates) {
     if (!statsMap.has(key)) {
       continue;
     }
     const statsValueNumber = readRemoteInteger(statsMap.get(key));
-    if (statsValueNumber !== null && statsValueNumber >= 0) {
-      return statsValueNumber;
+    const candidate = buildPieceCounterCandidate(source, statsValueNumber);
+    if (candidate) {
+      return candidate;
     }
   }
   return null;
@@ -1685,7 +1955,7 @@ async function evaluateVsCandidateObject(cdp, remoteValue, details, context) {
       break;
     }
   }
-  const pieceCounter = await extractRemotePieceCounter(cdp, propertyMap, context);
+  const pieceCounterCandidate = await extractRemotePieceCounter(cdp, propertyMap, context);
   let active = readRemoteBoolean(
     propertyMap.get("active") ?? propertyMap.get("alive") ?? propertyMap.get("playing")
   );
@@ -1742,7 +2012,7 @@ async function evaluateVsCandidateObject(cdp, remoteValue, details, context) {
   if (queue.length > 0) {
     score += 12;
   }
-  if (pieceCounter !== null) {
+  if (pieceCounterCandidate?.value !== undefined) {
     score += 12;
   }
   if (typeof active === "boolean") {
@@ -1763,6 +2033,7 @@ async function evaluateVsCandidateObject(cdp, remoteValue, details, context) {
     scopePriority: VS_SCOPE_PRIORITY.get(details.scopeType) ?? VS_SCOPE_TYPES.length,
     variablePath: details.variablePath,
     score,
+    gameObjectId: remoteObjectId(remoteValue),
     gameid: identityScore.gameid,
     userid: identityScore.userid,
     username: identityScore.username,
@@ -1773,7 +2044,8 @@ async function evaluateVsCandidateObject(cdp, remoteValue, details, context) {
     current,
     hold,
     queue,
-    pieceCounter,
+    pieceCounter: pieceCounterCandidate?.value ?? null,
+    pieceCounterSource: pieceCounterCandidate?.source ?? null,
     active: typeof active === "boolean" ? active : false,
     capturedAt: Date.now(),
     identityScore: {
@@ -2146,7 +2418,9 @@ export async function processVsObjectDiagnostics(
   {
     vsRoundStatus,
     tracking,
+    sessionState,
     liveSnapshotPath,
+    snapshotTracking,
     vsObjectSnapshotPath = DEFAULT_VS_OBJECT_SNAPSHOT_PATH,
     traceEnabled = false,
     scopeTraceEnabled = false,
@@ -2180,8 +2454,15 @@ export async function processVsObjectDiagnostics(
     tracking.lastCandidateLogSignature = "";
     tracking.lastNotFoundRoundId = "";
     resetVsScopeRoundState(tracking, now);
-    clearSnapshotFile(liveSnapshotPath);
-    clearSnapshotFile(vsObjectSnapshotPath);
+    resetSnapshotTracking(snapshotTracking);
+    resetSessionState(sessionState);
+    writeVsTombstones({
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      snapshotTracking,
+      tracking,
+      reason: "VS round changed"
+    });
   }
 
   const identity = {
@@ -2197,7 +2478,50 @@ export async function processVsObjectDiagnostics(
       objectId: tracking.cachedObjectId
     });
     if (cachedCandidate?.ok) {
-      const snapshot = buildVsObjectSnapshot(cachedCandidate, vsRoundStatus, "paused_scope");
+      const sessionId = updateSessionState(sessionState, {
+        playing: Boolean(cachedCandidate?.active),
+        roundId,
+        gameId: cachedCandidate?.gameid ?? vsRoundStatus?.localGameId ?? "",
+        gameObjectId: cachedCandidate?.gameObjectId ?? ""
+      });
+      if (!sessionId) {
+        resetSnapshotTracking(snapshotTracking);
+        writeVsTombstones({
+          liveSnapshotPath,
+          vsObjectSnapshotPath,
+          snapshotTracking,
+          tracking,
+          reason: "VS local game inactive"
+        });
+        return {
+          handled: true,
+          found: false,
+          candidate: null
+        };
+      }
+      if (!acceptPieceCounterSource(sessionState, cachedCandidate?.pieceCounterSource)) {
+        clearVsCachedHandle(tracking);
+        resetSnapshotTracking(snapshotTracking);
+        resetSessionState(sessionState);
+        writeVsTombstones({
+          liveSnapshotPath,
+          vsObjectSnapshotPath,
+          snapshotTracking,
+          tracking,
+          reason: "VS pieceCounter source changed"
+        });
+        return {
+          handled: true,
+          found: false,
+          candidate: null
+        };
+      }
+      const snapshot = buildVsObjectSnapshot(
+        cachedCandidate,
+        vsRoundStatus,
+        "paused_scope",
+        sessionId
+      );
       const signature = buildVsObjectSnapshotSignature(snapshot);
       if (signature !== tracking.lastSnapshotSignature) {
         writeSnapshot(liveSnapshotPath, snapshot);
@@ -2215,12 +2539,15 @@ export async function processVsObjectDiagnostics(
       clearVsCachedHandle(tracking);
       tracking.scopeCaptureLocked = true;
     }
-    if (tracking.lastSnapshotSignature) {
-      clearSnapshotFile(liveSnapshotPath);
-      clearSnapshotFile(vsObjectSnapshotPath);
-      tracking.lastSnapshotSignature = "";
-      tracking.lastCandidateLogSignature = "";
-    }
+    resetSnapshotTracking(snapshotTracking);
+    resetSessionState(sessionState);
+    writeVsTombstones({
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      snapshotTracking,
+      tracking,
+      reason: "VS cached object unavailable"
+    });
     return { handled: true, found: false, candidate: null };
   }
 
@@ -2294,12 +2621,15 @@ export async function processVsObjectDiagnostics(
   }
 
   if (!candidate?.ok) {
-    if (tracking.lastSnapshotSignature) {
-      clearSnapshotFile(liveSnapshotPath);
-      clearSnapshotFile(vsObjectSnapshotPath);
-      tracking.lastSnapshotSignature = "";
-      tracking.lastCandidateLogSignature = "";
-    }
+    resetSnapshotTracking(snapshotTracking);
+    resetSessionState(sessionState);
+    writeVsTombstones({
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      snapshotTracking,
+      tracking,
+      reason: "VS local game object not found"
+    });
     if (tracking.lastNotFoundRoundId !== roundId) {
       tracking.lastNotFoundRoundId = roundId;
       log("[vs-object] local game object not found");
@@ -2308,7 +2638,42 @@ export async function processVsObjectDiagnostics(
   }
 
   tracking.lastNotFoundRoundId = "";
-  const snapshot = buildVsObjectSnapshot(candidate, vsRoundStatus, snapshotSource);
+  const sessionId = updateSessionState(sessionState, {
+    playing: Boolean(candidate?.active),
+    roundId,
+    gameId: candidate?.gameid ?? vsRoundStatus?.localGameId ?? "",
+    gameObjectId: candidate?.gameObjectId ?? ""
+  });
+  if (!sessionId) {
+    resetSnapshotTracking(snapshotTracking);
+    writeVsTombstones({
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      snapshotTracking,
+      tracking,
+      reason: "VS local game inactive"
+    });
+    return { handled: true, found: false, candidate: null };
+  }
+  if (!acceptPieceCounterSource(sessionState, candidate?.pieceCounterSource)) {
+    clearVsCachedHandle(tracking);
+    resetSnapshotTracking(snapshotTracking);
+    resetSessionState(sessionState);
+    writeVsTombstones({
+      liveSnapshotPath,
+      vsObjectSnapshotPath,
+      snapshotTracking,
+      tracking,
+      reason: "VS pieceCounter source changed"
+    });
+    return { handled: true, found: false, candidate: null };
+  }
+  const snapshot = buildVsObjectSnapshot(
+    candidate,
+    vsRoundStatus,
+    snapshotSource,
+    sessionId
+  );
   const signature = buildVsObjectSnapshotSignature(snapshot);
   if (signature !== tracking.lastSnapshotSignature) {
     writeSnapshot(liveSnapshotPath, snapshot);
@@ -2555,6 +2920,7 @@ function buildSeedFallbackState(network) {
   const generated = getCurrentAndNext(network.seed, 0, network.nextCount);
   return {
     ok: Boolean(generated.current),
+    source: "seed_fallback",
     ready,
     reason: ready ? null : "TETR.IO seed captured; waiting for countdown timing",
     field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
@@ -2565,6 +2931,9 @@ function buildSeedFallbackState(network) {
     combo: 0,
     incoming: 0,
     pieceCounter: 0,
+    pieceCounterSource: "seed_fallback",
+    gameId: network.seed ? `seed:${network.seed}` : "seed_fallback",
+    gameObjectId: "seed_fallback",
     playing: ready,
     countdown: !ready
   };
@@ -2828,6 +3197,31 @@ export function vsObjectStateExpression(identity) {
       if (!Array.isArray(value)) return [];
       return value.map((item) => normalizePiece(item)).filter(Boolean).slice(0, 12);
     };
+    const integerCounter = (value) => {
+      if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+        return value;
+      }
+      return null;
+    };
+    const selectPieceCounter = (source) => {
+      const stats = ownValue(source, ["stats"]);
+      const candidates = [
+        ["pieceCounter", ownValue(source, ["pieceCounter"])],
+        ["piecesPlaced", ownValue(source, ["piecesPlaced"])],
+        ["piecesplaced", ownValue(source, ["piecesplaced"])],
+        ["piececount", ownValue(source, ["piececount"])],
+        ["stats.piecesPlaced", ownValue(stats, ["piecesPlaced"])],
+        ["stats.pieces", ownValue(stats, ["pieces"])],
+        ["pieces", ownValue(source, ["pieces"])]
+      ];
+      for (const [counterSource, candidateValue] of candidates) {
+        const normalized = integerCounter(candidateValue);
+        if (normalized !== null) {
+          return { value: normalized, source: counterSource };
+        }
+      }
+      return { value: null, source: null };
+    };
     const collectIdentity = (source, target) => {
       if (!source || !isObjectLike(source)) return target;
       const assign = (key, value) => {
@@ -2884,13 +3278,7 @@ export function vsObjectStateExpression(identity) {
         (sum, row) => sum + row.filter(Boolean).length,
         0
       );
-      const stats = ownValue(source, ["stats"]);
-      const pieceCounterValue = numberFrom(
-        ownValue(source, ["pieceCounter", "piececount", "piecesplaced", "piecesPlaced", "pieces"]),
-        ownValue(stats, ["pieceCounter", "piececount", "piecesplaced", "piecesPlaced", "pieces"])
-      );
-      const pieceCounter =
-        pieceCounterValue === null ? null : Math.max(0, Math.floor(pieceCounterValue));
+      const pieceCounter = selectPieceCounter(source);
       return {
         board,
         boardWidth: board[0]?.length ?? 0,
@@ -2899,7 +3287,8 @@ export function vsObjectStateExpression(identity) {
         current,
         hold,
         queue,
-        pieceCounter,
+        pieceCounter: pieceCounter.value,
+        pieceCounterSource: pieceCounter.source,
         active
       };
     };
@@ -2957,6 +3346,7 @@ export function vsObjectStateExpression(identity) {
         hold: shape.hold,
         queue: shape.queue,
         pieceCounter: shape.pieceCounter,
+        pieceCounterSource: shape.pieceCounterSource,
         active: shape.active,
         score,
         shapeRef: shapeEntry.value,
@@ -3008,6 +3398,7 @@ export function vsObjectStateExpression(identity) {
       return {
         ok: true,
         path: candidate.path,
+        gameObjectId: String(touchMeta(candidate.shapeRef)?.id ?? ""),
         gameid: candidate.gameid,
         userid: candidate.userid,
         username: candidate.username,
@@ -3018,6 +3409,8 @@ export function vsObjectStateExpression(identity) {
         current: candidate.current,
         hold: candidate.hold,
         queue: candidate.queue,
+        pieceCounter: candidate.pieceCounter,
+        pieceCounterSource: candidate.pieceCounterSource,
         active: candidate.active,
         capturedAt: Date.now()
       };
@@ -3165,6 +3558,26 @@ export function tetrioStateExpression() {
       const number = numberFrom(...values);
       return number === null ? null : Math.floor(number);
     };
+    const integerCounter = (value) =>
+      typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+    const selectPieceCounter = (state, stats) => {
+      const candidates = [
+        ["pieceCounter", state?.pieceCounter],
+        ["piecesPlaced", state?.piecesPlaced],
+        ["piecesplaced", state?.piecesplaced],
+        ["piececount", state?.piececount],
+        ["stats.piecesPlaced", stats?.piecesPlaced],
+        ["stats.pieces", stats?.pieces],
+        ["pieces", state?.pieces]
+      ];
+      for (const [source, value] of candidates) {
+        const normalized = integerCounter(value);
+        if (normalized !== null) {
+          return { value: normalized, source };
+        }
+      }
+      return { value: null, source: null };
+    };
     const rotationFrom = (...values) => {
       for (const value of values) {
         if (value === null || value === undefined) continue;
@@ -3253,6 +3666,20 @@ export function tetrioStateExpression() {
     if (!game) {
       return { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" };
     }
+    if (!window.__fusionGameObjectIds || typeof window.__fusionGameObjectIds !== "object") {
+      window.__fusionGameObjectIds = {
+        nextId: 1,
+        ids: new WeakMap()
+      };
+    }
+    if (!(window.__fusionGameObjectIds.ids instanceof WeakMap)) {
+      window.__fusionGameObjectIds.ids = new WeakMap();
+    }
+    let gameObjectId = window.__fusionGameObjectIds.ids.get(game);
+    if (!gameObjectId) {
+      gameObjectId = String(window.__fusionGameObjectIds.nextId++);
+      window.__fusionGameObjectIds.ids.set(game, gameObjectId);
+    }
     window.__fusionTetrioGame = game;
     const exported = typeof game.ejectState === "function" ? game.ejectState() : null;
     const boardState = typeof game.ejectBoardState === "function" ? game.ejectBoardState() : null;
@@ -3274,15 +3701,7 @@ export function tetrioStateExpression() {
     const hold = normalizePiece(state.hold ?? state.held);
     const queue = queueFrom(state.bag, state.queue, state.next, state.preview, state.previews, state.pieces);
     const stats = state.stats ?? {};
-    const pieceCounter = Math.max(0, Math.floor(numberFrom(
-      stats.piecesplaced,
-      stats.piecesPlaced,
-      stats.pieces,
-      state.piecesplaced,
-      state.piecesPlaced,
-      state.pieceCounter,
-      state.piececount
-    ) ?? -1));
+    const pieceCounter = selectPieceCounter(state, stats);
     const linesClearedRaw = numberFrom(
       stats.lines,
       stats.linesCleared,
@@ -3293,7 +3712,7 @@ export function tetrioStateExpression() {
     );
     const linesCleared =
       linesClearedRaw === null ? null : Math.max(0, Math.floor(linesClearedRaw));
-    if (!current || pieceCounter < 0) {
+    if (!current || pieceCounter.value === null) {
       return { ok: false, ready: false, reason: "TETR.IO current piece or piece counter is not available" };
     }
 
@@ -3343,7 +3762,9 @@ export function tetrioStateExpression() {
       b2b: Math.max(0, numberFrom(stats.b2b, state.b2b, 0) ?? 0) > 0,
       combo: Math.max(0, numberFrom(stats.combo, state.combo, 0) ?? 0),
       incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
-      pieceCounter,
+      pieceCounter: pieceCounter.value,
+      pieceCounterSource: pieceCounter.source,
+      gameObjectId,
       linesCleared: linesCleared ?? undefined,
       playing,
       countdown,

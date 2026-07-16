@@ -3,8 +3,8 @@ import json
 import os
 import queue
 import subprocess
-import sys
 import threading
+import time
 
 from app_paths import get_resource_path
 
@@ -25,6 +25,16 @@ class GomenSession:
         self.stdout_queue = queue.Queue()
         self.reader_thread = None
         self.lock = threading.Lock()
+        self.last_reader_warning = ""
+        self.last_reader_warning_at = 0.0
+
+    def _log_reader_warning(self, message):
+        now = time.monotonic()
+        if message == self.last_reader_warning and now - self.last_reader_warning_at < 2.0:
+            return
+        self.last_reader_warning = message
+        self.last_reader_warning_at = now
+        print(f"[gomen reader] {message}")
 
     def ensure_started(self, timeout_sec=20):
         if self.proc is not None and self.proc.poll() is None:
@@ -41,6 +51,9 @@ class GomenSession:
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NO_WINDOW
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
 
         self.proc = subprocess.Popen(
             [get_node_executable(), script_path],
@@ -49,8 +62,11 @@ class GomenSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             creationflags=creationflags,
+            env=env,
         )
         self.stdout_queue = queue.Queue()
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -64,10 +80,26 @@ class GomenSession:
     def _reader_loop(self):
         try:
             while self.proc is not None and self.proc.stdout is not None:
-                line = self.proc.stdout.readline()
+                try:
+                    line = self.proc.stdout.readline()
+                except Exception as exc:
+                    self._log_reader_warning(f"stdout read failed: {exc!r}")
+                    if self.proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+
                 if not line:
+                    if self.proc.poll() is None:
+                        self._log_reader_warning("stdout closed without process exit; retrying")
+                        time.sleep(0.05)
+                        continue
                     break
-                self.stdout_queue.put(line.rstrip("\r\n"))
+
+                try:
+                    self.stdout_queue.put(line.rstrip("\r\n"))
+                except Exception as exc:
+                    self._log_reader_warning(f"stdout queue put failed: {exc!r}")
         finally:
             self.stdout_queue.put(None)
 

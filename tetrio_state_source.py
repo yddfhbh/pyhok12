@@ -53,11 +53,13 @@ class SnapshotValidationError(ValueError):
 class NormalizedSnapshot:
     mode: str
     source: str
+    session_id: str
     board: list
     current: str
     hold: str | None
     queue: list
     piece_counter: int
+    piece_counter_source: str
     game_id: str | None
     round_id: str | None
     token: str
@@ -157,12 +159,14 @@ def normalize_snapshot_payload(
     now_ms=None,
     stale_after_ms=1000,
     required_queue_length=1,
-    previous_snapshot=None,
 ):
     if not isinstance(payload, dict):
         raise SnapshotValidationError("snapshot JSON이 객체가 아닙니다.")
 
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    ready = payload.get("ready")
+    if ready is not True:
+        raise SnapshotValidationError("ready=false 상태라서 solver에 전달할 수 없습니다.")
     playing = payload.get("playing")
     if playing is not True:
         raise SnapshotValidationError("playing=false 상태라서 solver에 전달할 수 없습니다.")
@@ -205,36 +209,33 @@ def normalize_snapshot_payload(
         raise SnapshotValidationError("pieceCounter가 유효한 정수가 아닙니다.") from exc
     if piece_counter < 0:
         raise SnapshotValidationError("pieceCounter가 음수입니다.")
+    piece_counter_source = str(payload.get("pieceCounterSource") or "").strip()
+    if not piece_counter_source:
+        raise SnapshotValidationError("pieceCounterSource가 비어 있습니다.")
 
     game_id = str(payload.get("gameId")).strip() if payload.get("gameId") is not None else None
     round_id = str(payload.get("roundId")).strip() if payload.get("roundId") is not None else None
-    identity = round_id or game_id
-    if not identity:
-        raise SnapshotValidationError("gameId 또는 roundId가 없습니다.")
+    session_id = str(payload.get("sessionId") or "").strip()
+    if not session_id:
+        raise SnapshotValidationError("sessionId가 비어 있습니다.")
 
-    token = str(payload.get("token") or f"{identity}:{piece_counter}").strip()
+    token = str(payload.get("token") or f"{session_id}:{piece_counter}").strip()
     if not token:
         raise SnapshotValidationError("snapshot token이 비어 있습니다.")
 
-    if previous_snapshot is not None:
-        if captured_at < previous_snapshot.captured_at:
-            raise SnapshotValidationError("snapshot 시간이 역행했습니다.")
-        if identity == (previous_snapshot.round_id or previous_snapshot.game_id):
-            if piece_counter < previous_snapshot.piece_counter:
-                raise SnapshotValidationError("같은 게임에서 pieceCounter가 감소했습니다.")
-
     mode = str(payload.get("mode") or ("VS" if round_id else "Solo")).strip() or "Unknown"
     source = str(payload.get("source") or "browser_cdp").strip() or "browser_cdp"
-    ready = bool(payload.get("ready", True))
 
     return NormalizedSnapshot(
         mode=mode,
         source=source,
+        session_id=session_id,
         board=board,
         current=current,
         hold=hold,
         queue=queue,
         piece_counter=piece_counter,
+        piece_counter_source=piece_counter_source,
         game_id=game_id,
         round_id=round_id,
         token=token,
@@ -263,6 +264,22 @@ class TetrioStateSource:
         self.browser_connected = False
         self.last_valid_snapshot = None
         self.restart_times = []
+        self.next_restart_allowed_at = 0.0
+        self._last_session_id = None
+        self._last_game_key = None
+        self._last_piece_counter = None
+        self._last_piece_counter_source = None
+        self._last_captured_at = None
+        self._last_token = None
+        self._last_snapshot_seen = False
+
+    def _reset_sequence_guard(self) -> None:
+        self._last_session_id = None
+        self._last_game_key = None
+        self._last_piece_counter = None
+        self._last_piece_counter_source = None
+        self._last_captured_at = None
+        self._last_token = None
 
     def reload_config(self):
         with self.lock:
@@ -274,12 +291,28 @@ class TetrioStateSource:
         with self.lock:
             if self.proc is not None and self.proc.poll() is None:
                 return
+            if self.proc is not None and self.proc.poll() is not None:
+                self.proc = None
+            now = time.time()
+            if now < self.next_restart_allowed_at:
+                wait_sec = max(0.1, self.next_restart_allowed_at - now)
+                raise RuntimeError(f"CDP source 재시작 대기 중입니다. {wait_sec:.1f}초 후 다시 시도합니다.")
             self._prune_restarts()
             cdp_config = self.config["tetrio_cdp"]
+            max_restart_attempts = int(cdp_config.get("max_restart_attempts", 3))
+            restart_window_sec = max(1, int(cdp_config.get("restart_window_sec", 60)))
+            if len(self.restart_times) >= max_restart_attempts:
+                oldest_restart = self.restart_times[0]
+                self.next_restart_allowed_at = oldest_restart + restart_window_sec
+                wait_sec = max(0.1, self.next_restart_allowed_at - now)
+                raise RuntimeError(
+                    f"CDP source 재시작 한도를 초과했습니다. {wait_sec:.1f}초 후 자동으로 다시 시도합니다."
+                )
             if len(self.restart_times) >= int(cdp_config.get("max_restart_attempts", 3)):
                 raise RuntimeError("CDP source 재시작 한도를 초과했습니다.")
 
-            self.restart_times.append(time.time())
+            self.restart_times.append(now)
+            self.next_restart_allowed_at = 0.0
             command = self._build_command()
             env = os.environ.copy()
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -291,12 +324,15 @@ class TetrioStateSource:
                 stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 creationflags=creationflags,
                 env=env,
             )
             self.last_ready = False
             self.browser_connected = False
+            self.last_valid_snapshot = None
+            self._reset_sequence_guard()
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
@@ -321,6 +357,8 @@ class TetrioStateSource:
         if not restart:
             self.browser_connected = False
             self.last_ready = False
+        self.last_valid_snapshot = None
+        self._reset_sequence_guard()
 
     def get_latest_result(self):
         snapshot = self.get_latest_valid_snapshot()
@@ -339,9 +377,26 @@ class TetrioStateSource:
 
     def get_latest_valid_snapshot(self):
         with self.lock:
-            self._ensure_running()
+            try:
+                self._ensure_running()
+            except Exception as exc:
+                self._remember_error(str(exc))
+                self.last_valid_snapshot = None
+                return None
             payload = self._read_snapshot_payload()
             if payload is None:
+                self.last_reason = "Waiting for game state"
+                self.last_valid_snapshot = None
+                return None
+
+            if not isinstance(payload, dict):
+                self._remember_error("snapshot JSON이 객체가 아닙니다.")
+                self.last_valid_snapshot = None
+                return None
+
+            if payload.get("ready") is not True or payload.get("playing") is not True:
+                self._reset_sequence_guard()
+                self.last_valid_snapshot = None
                 self.last_reason = "Waiting for game state"
                 return None
 
@@ -350,25 +405,64 @@ class TetrioStateSource:
                     payload,
                     stale_after_ms=self.config["tetrio_cdp"]["stale_after_ms"],
                     required_queue_length=self.config["tetrio_cdp"]["required_queue_length"],
-                    previous_snapshot=self.last_valid_snapshot,
                 )
             except SnapshotValidationError as exc:
                 self.last_reason = str(exc)
                 self._remember_error(str(exc))
+                self.last_valid_snapshot = None
+                return None
+
+            if self._last_session_id != snapshot.session_id:
+                self._reset_sequence_guard()
+                self._last_session_id = snapshot.session_id
+
+            if self._last_captured_at is not None and snapshot.captured_at < self._last_captured_at:
+                self.last_reason = "snapshot 시간이 역행했습니다."
+                self._remember_error(self.last_reason)
+                self.last_valid_snapshot = None
+                return None
+
+            if (
+                self._last_piece_counter_source is not None
+                and snapshot.piece_counter_source != self._last_piece_counter_source
+            ):
+                self.last_reason = "같은 세션에서 pieceCounter source가 변경되었습니다."
+                self._remember_error(self.last_reason)
+                self.last_valid_snapshot = None
+                return None
+
+            if (
+                self._last_piece_counter is not None
+                and snapshot.piece_counter < self._last_piece_counter
+            ):
+                self.last_reason = "같은 세션에서 pieceCounter가 감소했습니다."
+                self._remember_error(self.last_reason)
+                self.last_valid_snapshot = None
                 return None
 
             self.last_valid_snapshot = snapshot
+            self._last_game_key = snapshot.round_id or snapshot.game_id
+            self._last_piece_counter = snapshot.piece_counter
+            self._last_piece_counter_source = snapshot.piece_counter_source
+            self._last_captured_at = snapshot.captured_at
+            self._last_token = snapshot.token
             self.last_reason = "Ready"
             return snapshot
 
     def get_status(self):
-        snapshot = self.get_latest_valid_snapshot()
+        try:
+            snapshot = self.get_latest_valid_snapshot()
+        except Exception as exc:
+            self._remember_error(f"상태 갱신 실패: {exc}")
+            snapshot = None
+        helper_running = self.proc is not None and self.proc.poll() is None
         browser_status = "Connected" if self.browser_connected else "Disconnected"
         game_state = "Ready"
         detail = self.last_reason
 
-        if self.proc is None or self.proc.poll() is not None:
-            browser_status = "Disconnected"
+        if not helper_running:
+            browser_status = "Reconnecting"
+            game_state = "Waiting"
             if self.last_error:
                 detail = self.last_error
         elif not self.last_ready:
@@ -430,7 +524,14 @@ class TetrioStateSource:
     def _ensure_running(self):
         if self.proc is not None and self.proc.poll() is None:
             return
-        self.start()
+        self.browser_connected = False
+        self.last_ready = False
+        self._reset_sequence_guard()
+        try:
+            self.start()
+        except Exception as exc:
+            self._remember_error(str(exc))
+            raise
 
     def _reader_loop(self):
         proc = self.proc
@@ -462,15 +563,29 @@ class TetrioStateSource:
                     self._remember_error(line)
                 elif "[browser]" in lowered:
                     self.last_reason = line.replace("[browser]", "").strip()
+        except Exception as exc:
+            self._remember_error(f"helper stdout reader failed: {exc!r}")
         finally:
-            if proc.poll() is not None:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                self._remember_error(f"CDP helper가 종료되었습니다. exit code={exit_code}")
                 self.browser_connected = False
                 self.last_ready = False
+                self.last_valid_snapshot = None
+                self._reset_sequence_guard()
+                with self.lock:
+                    if self.proc is proc:
+                        self.proc = None
 
     def _read_snapshot_payload(self):
         snapshot_path = self._resolve_runtime_path(self.config["tetrio_cdp"]["snapshot_path"])
         if not snapshot_path.exists():
+            if self._last_snapshot_seen:
+                self._reset_sequence_guard()
+                self.last_valid_snapshot = None
+            self._last_snapshot_seen = False
             return None
+        self._last_snapshot_seen = True
         try:
             with snapshot_path.open("r", encoding="utf-8") as handle:
                 return json.load(handle)
