@@ -59,6 +59,7 @@ class NormalizedSnapshot:
     queue: list
     piece_counter: int | None
     piece_counter_source: str
+    lines_cleared: int | None
     state_revision: int
     game_id: str | None
     round_id: str | None
@@ -102,14 +103,47 @@ def calculate_pc_round(pieces_count):
     return (int(pieces_count) // 10) % 7 + 1
 
 
+def _get_nested_value(payload, path):
+    current = payload
+    for key in path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_nonnegative_int(payload, candidate_paths):
+    for path in candidate_paths:
+        value = _get_nested_value(payload, path)
+        if value is None:
+            continue
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        if normalized >= 0:
+            return normalized
+    return None
+
+
+def count_fixed_board_cells(board):
+    return sum(1 for row in (board or []) for cell in row if cell != ".")
+
+
 def resolve_effective_piece_progress(snapshot):
     if snapshot is None:
         return None
     if snapshot.piece_counter is not None:
         return int(snapshot.piece_counter)
-    if snapshot.piece_counter_source == "derived-revision":
-        return int(snapshot.state_revision)
-    return None
+    if str(snapshot.mode or "").strip().lower() != "solo":
+        return None
+    if snapshot.lines_cleared is None:
+        return None
+    fixed_cells = count_fixed_board_cells(snapshot.board)
+    numerator = fixed_cells + int(snapshot.lines_cleared) * 10
+    if numerator < 0 or numerator % 4 != 0:
+        return None
+    return numerator // 4
 
 
 def _normalize_piece(value, allow_none=False):
@@ -215,6 +249,29 @@ def normalize_snapshot_payload(
     piece_counter_source = str(payload.get("pieceCounterSource") or "").strip()
     if not piece_counter_source:
         raise SnapshotValidationError("pieceCounterSource가 비어 있습니다.")
+    lines_cleared = _extract_nonnegative_int(
+        payload,
+        (
+            "linesCleared",
+            "lines_cleared",
+            "lines",
+            "stats.lines",
+            "stats.linesCleared",
+            "stats.lines_cleared",
+            "ejectState.linesCleared",
+            "ejectState.lines_cleared",
+            "ejectState.lines",
+            "ejectState.stats.lines",
+            "ejectState.stats.linesCleared",
+            "ejectState.stats.lines_cleared",
+            "gameState.linesCleared",
+            "gameState.lines_cleared",
+            "gameState.lines",
+            "gameState.stats.lines",
+            "gameState.stats.linesCleared",
+            "gameState.stats.lines_cleared",
+        ),
+    )
     state_revision = payload.get("stateRevision")
     if state_revision is None:
         state_revision = payload.get("pieceCounter")
@@ -225,15 +282,35 @@ def normalize_snapshot_payload(
     if state_revision < 0:
         raise SnapshotValidationError("stateRevision이 음수입니다.")
 
-    piece_counter_raw = payload.get("pieceCounter")
-    piece_counter = None
-    if piece_counter_source != "derived-revision" or piece_counter_raw is not None:
-        try:
-            piece_counter = int(piece_counter_raw)
-        except (TypeError, ValueError) as exc:
-            raise SnapshotValidationError("pieceCounter가 유효한 정수가 아닙니다.") from exc
-        if piece_counter < 0:
-            raise SnapshotValidationError("pieceCounter가 음수입니다.")
+    piece_counter_raw = _extract_nonnegative_int(
+        payload,
+        (
+            "pieceCounter",
+            "piecesPlaced",
+            "piecesplaced",
+            "piececount",
+            "stats.pieceCounter",
+            "stats.piecesPlaced",
+            "stats.pieces",
+            "ejectState.pieceCounter",
+            "ejectState.piecesPlaced",
+            "ejectState.piecesplaced",
+            "ejectState.piececount",
+            "ejectState.stats.pieceCounter",
+            "ejectState.stats.piecesPlaced",
+            "ejectState.stats.pieces",
+            "ejectBoardState.pieceCounter",
+            "gameState.pieceCounter",
+            "gameState.piecesPlaced",
+            "gameState.piecesplaced",
+            "gameState.piececount",
+            "gameState.stats.pieceCounter",
+            "gameState.stats.piecesPlaced",
+            "gameState.stats.pieces",
+            "boardState.pieceCounter",
+        ),
+    )
+    piece_counter = piece_counter_raw
 
     game_id = str(payload.get("gameId")).strip() if payload.get("gameId") is not None else None
     round_id = str(payload.get("roundId")).strip() if payload.get("roundId") is not None else None
@@ -258,6 +335,7 @@ def normalize_snapshot_payload(
         queue=queue,
         piece_counter=piece_counter,
         piece_counter_source=piece_counter_source,
+        lines_cleared=lines_cleared,
         state_revision=state_revision,
         game_id=game_id,
         round_id=round_id,

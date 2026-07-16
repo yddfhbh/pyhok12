@@ -323,19 +323,138 @@ def make_gomen_queue(active, hold, queue, manual_see=""):
     return state_queue
 
 
-def board_to_gomen_garbage(board):
+def get_gomen_bottom_rows(board):
     if not board or len(board) < 4:
         raise GomenError("보드 데이터가 부족함")
 
+    rows = []
+    for row in board[-4:]:
+        text = "".join("X" if cell != "." else "." for cell in (row or [])[:10])
+        rows.append((text + "." * 10)[:10])
+    return rows
+
+
+def board_to_gomen_garbage(board):
+    """
+    Encode the visible bottom 4 rows for Gomen.
+
+    Mapping:
+    - only the bottom 4 visible rows are encoded
+    - bit 0 = bottom row, leftmost column
+    - bits increase left -> right within a row
+    - then continue bottom -> top across the 4 rows
+    - occupied cell = 1, empty cell = 0
+    """
     value = 0
-    bottom_rows = board[-4:]
+    bottom_rows = get_gomen_bottom_rows(board)
     for row_offset, row in enumerate(reversed(bottom_rows)):
-        for col_index, cell in enumerate((row or [])[:10]):
+        for col_index, cell in enumerate(row[:10]):
             if cell != ".":
                 bit_index = row_offset * 10 + col_index
                 value |= 1 << bit_index
 
     return value
+
+
+def gomen_garbage_to_bottom_rows(garbage):
+    try:
+        value = int(garbage)
+    except (TypeError, ValueError) as exc:
+        raise GomenError("garbage 값이 유효한 정수가 아닙니다.") from exc
+
+    rows = []
+    for row_offset in range(3, -1, -1):
+        cells = []
+        for col_index in range(10):
+            bit_index = row_offset * 10 + col_index
+            cells.append("X" if (value >> bit_index) & 1 else ".")
+        rows.append("".join(cells))
+    return rows
+
+
+def format_gomen_garbage_bits(garbage):
+    return format(int(garbage), "040b")
+
+
+def build_gomen_debug_payload(board, active, hold, queue, state_queue, queue_text, garbage, branch_name):
+    return {
+        "branch_name": str(branch_name or ""),
+        "bottom_rows": get_gomen_bottom_rows(board),
+        "garbage": int(garbage),
+        "garbage_bits": format_gomen_garbage_bits(garbage),
+        "active": clean_piece_text(active),
+        "hold": clean_piece_text(hold),
+        "raw_queue": [piece for piece in (queue or []) if piece in VALID_PIECES],
+        "state_queue": str(state_queue or ""),
+        "queue_text": str(queue_text or ""),
+    }
+
+
+def log_gomen_request(debug_payload):
+    print(f"[GOMEN REQUEST] branch={debug_payload['branch_name'] or '-'}")
+    for index, row_text in enumerate(debug_payload["bottom_rows"], start=1):
+        print(f"[GOMEN REQUEST] bottom_row_{index}={row_text}")
+    print(f"[GOMEN REQUEST] garbage_dec={debug_payload['garbage']}")
+    print(f"[GOMEN REQUEST] garbage_bits={debug_payload['garbage_bits']}")
+    print(f"[GOMEN REQUEST] active={debug_payload['active'] or '-'}")
+    print(f"[GOMEN REQUEST] hold={debug_payload['hold'] or '-'}")
+    print(f"[GOMEN REQUEST] raw_queue={debug_payload['raw_queue']}")
+    print(f"[GOMEN REQUEST] state_queue={debug_payload['state_queue'] or '-'}")
+    print(f"[GOMEN REQUEST] queue_text={debug_payload['queue_text'] or '-'}")
+
+
+def build_gomen_branches(active, hold, queue, manual_see=""):
+    state_queue = make_state_queue(active, queue, manual_see=manual_see)
+    hold_piece = clean_piece_text(hold)
+    branches = [
+        {
+            "name": "active-first",
+            "queue_text": state_queue,
+            "target_queue": state_queue,
+            "hold": True,
+        }
+    ]
+    if hold_piece and not clean_piece_text(manual_see):
+        branches.append(
+            {
+                "name": "hold-first",
+                "queue_text": hold_piece[0] + state_queue,
+                "target_queue": hold_piece[0] + state_queue,
+                "hold": True,
+            }
+        )
+    return state_queue, branches
+
+
+def _run_gomen_branch(session, branch, garbage, *, timeout_sec, physics, limit):
+    result = session.solve(
+        queue_text=branch["queue_text"],
+        garbage=garbage,
+        hold=branch.get("hold", True),
+        physics=physics,
+        limit=limit,
+        timeout_sec=timeout_sec,
+        target_queue=branch.get("target_queue", ""),
+    )
+    result["branch_name"] = branch["name"]
+    result["engine_zero"] = int(result.get("total") or 0) == 0
+    result["exact_queue_filter_miss"] = (
+        int(result.get("total") or 0) > 0 and not bool(result.get("exact_match_used"))
+    )
+    return result
+
+
+def _select_best_gomen_branch_result(branch_results):
+    def sort_key(item):
+        return (
+            1 if int(item.get("total") or 0) > 0 else 0,
+            1 if int(item.get("shown_total") or 0) > 0 else 0,
+            int(item.get("total") or 0),
+            int(item.get("shown_total") or 0),
+            -int(item.get("branch_index") or 0),
+        )
+
+    return max(branch_results, key=sort_key)
 
 
 def get_gomen_session():
@@ -362,14 +481,17 @@ def warm_gomen_session(timeout_sec=20):
 
 
 def run_gomen_solver(board, active, hold, queue, manual_see="", limit=6, physics="SRS", timeout_sec=20):
-    state_queue = make_state_queue(active, queue, manual_see=manual_see)
-    queue_text = make_gomen_queue(active, hold, queue, manual_see=manual_see)
+    state_queue, branches = build_gomen_branches(active, hold, queue, manual_see=manual_see)
     garbage = board_to_gomen_garbage(board)
+    hold_text = clean_piece_text(hold)
+    raw_queue = tuple(piece for piece in (queue or []) if piece in VALID_PIECES)
 
     cache_key = (
-        tuple("".join(row) for row in board[-4:]),
-        queue_text,
-        bool(True),
+        tuple(get_gomen_bottom_rows(board)),
+        clean_piece_text(active),
+        hold_text,
+        raw_queue,
+        clean_piece_text(manual_see),
         physics,
         int(limit),
     )
@@ -378,17 +500,35 @@ def run_gomen_solver(board, active, hold, queue, manual_see="", limit=6, physics
         return copy.deepcopy(cached)
 
     session = get_gomen_session()
-    result = session.solve(
-        queue_text=queue_text,
-        garbage=garbage,
-        hold=True,
-        physics=physics,
-        limit=limit,
-        timeout_sec=timeout_sec,
-        target_queue=queue_text,
-    )
-    result["queue_text"] = queue_text
-    result["state_queue"] = state_queue
-    result["garbage"] = str(garbage)
-    _RESULT_CACHE[cache_key] = copy.deepcopy(result)
-    return result
+    branch_results = []
+    for branch_index, branch in enumerate(branches):
+        debug_payload = build_gomen_debug_payload(
+            board,
+            active,
+            hold,
+            queue,
+            state_queue,
+            branch["queue_text"],
+            garbage,
+            branch["name"],
+        )
+        log_gomen_request(debug_payload)
+        result = _run_gomen_branch(
+            session,
+            branch,
+            garbage,
+            timeout_sec=timeout_sec,
+            physics=physics,
+            limit=limit,
+        )
+        result["branch_index"] = branch_index
+        result["debug_request"] = debug_payload
+        branch_results.append(result)
+
+    selected = copy.deepcopy(_select_best_gomen_branch_result(branch_results))
+    selected["branch_results"] = copy.deepcopy(branch_results)
+    selected["queue_text"] = selected["debug_request"]["queue_text"]
+    selected["state_queue"] = state_queue
+    selected["garbage"] = str(garbage)
+    _RESULT_CACHE[cache_key] = copy.deepcopy(selected)
+    return selected
