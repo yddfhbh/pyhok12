@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -11,6 +12,7 @@ from tetrio_state_source import (
     SnapshotValidationError,
     TetrioStateSource,
     normalize_snapshot_payload,
+    resolve_effective_piece_progress,
 )
 
 
@@ -298,6 +300,7 @@ class SnapshotNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(snapshot.piece_counter)
         self.assertEqual(snapshot.state_revision, 7)
+        self.assertEqual(resolve_effective_piece_progress(snapshot), 7)
 
 
 class TetrioStateSourceTests(unittest.TestCase):
@@ -607,6 +610,60 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertEqual(source.next_restart_allowed_at, 0.0)
             self.assertEqual(source.restart_backoff_sec, 0.5)
             self.assertEqual(source.last_error, "")
+
+    def test_get_latest_result_uses_state_revision_when_piece_counter_is_derived(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source._ensure_running = lambda: None
+
+            write_snapshot(
+                snapshot_path,
+                make_payload(
+                    pieceCounter=None,
+                    pieceCounterSource="derived-revision",
+                    stateRevision=4,
+                    token="session-1:4",
+                ),
+            )
+            result = source.get_latest_result()
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["piece_counter"], None)
+            self.assertEqual(result["piece_counter_source"], "derived-revision")
+            self.assertEqual(result["state_revision"], 4)
+            self.assertEqual(result["pieces_count"], 4)
+            self.assertEqual(result["pc_round"], 1)
+
+    def test_get_latest_result_prefers_real_piece_counter_over_state_revision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source._ensure_running = lambda: None
+
+            write_snapshot(
+                snapshot_path,
+                make_payload(
+                    pieceCounter=11,
+                    pieceCounterSource="state.stats.pieces",
+                    stateRevision=99,
+                    token="session-1:11",
+                ),
+            )
+            result = source.get_latest_result()
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["pieces_count"], 11)
+            self.assertEqual(result["pc_round"], 2)
+
+    def test_effective_piece_progress_is_none_when_counter_and_revision_are_unavailable(self):
+        snapshot = SimpleNamespace(
+            piece_counter=None,
+            piece_counter_source="unknown-source",
+            state_revision=None,
+        )
+
+        self.assertIsNone(resolve_effective_piece_progress(snapshot))
 
     def test_restart_backoff_caps_at_five_seconds(self):
         with tempfile.TemporaryDirectory() as tmpdir:

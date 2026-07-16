@@ -102,6 +102,16 @@ def calculate_pc_round(pieces_count):
     return (int(pieces_count) // 10) % 7 + 1
 
 
+def resolve_effective_piece_progress(snapshot):
+    if snapshot is None:
+        return None
+    if snapshot.piece_counter is not None:
+        return int(snapshot.piece_counter)
+    if snapshot.piece_counter_source == "derived-revision":
+        return int(snapshot.state_revision)
+    return None
+
+
 def _normalize_piece(value, allow_none=False):
     if value is None:
         return None if allow_none else ""
@@ -415,14 +425,18 @@ class TetrioStateSource:
         snapshot = self.get_latest_valid_snapshot()
         if snapshot is None:
             return None
+        pieces_count = resolve_effective_piece_progress(snapshot)
         return {
             "board": snapshot.board,
             "current": snapshot.current,
             "active_guess": snapshot.current,
             "hold": snapshot.hold or "",
             "queue": snapshot.queue,
-            "pieces_count": snapshot.piece_counter,
-            "pc_round": calculate_pc_round(snapshot.piece_counter),
+            "pieces_count": pieces_count,
+            "pc_round": calculate_pc_round(pieces_count),
+            "piece_counter": snapshot.piece_counter,
+            "piece_counter_source": snapshot.piece_counter_source,
+            "state_revision": snapshot.state_revision,
             "snapshot": snapshot,
         }
 

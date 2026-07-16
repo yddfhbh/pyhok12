@@ -2095,6 +2095,19 @@ class TetrisScannerApp:
         except RuntimeError:
             pass
 
+    def _log_state_result(self, result):
+        print(
+            "[STATE RESULT]",
+            "pieceCounter=", result.get("piece_counter"),
+            "pieceCounterSource=", result.get("piece_counter_source"),
+            "stateRevision=", result.get("state_revision"),
+            "pieces_count=", result.get("pieces_count"),
+            "pc_round=", result.get("pc_round"),
+            "current=", result.get("current"),
+            "hold=", result.get("hold"),
+            "queue=", result.get("queue"),
+        )
+
     def _scan_worker(self, scan_target, show_popup):
         try:
             print("[STATE] read start")
@@ -2103,14 +2116,7 @@ class TetrisScannerApp:
                 detail = self.state_source.get_status().get("detail") or "Waiting for game state"
                 raise RuntimeError(detail)
 
-            print(
-                "[STATE RESULT]",
-                "pieces_count=", result.get("pieces_count"),
-                "pc_round=", result.get("pc_round"),
-                "current=", result.get("current"),
-                "hold=", result.get("hold"),
-                "queue=", result.get("queue"),
-            )
+            self._log_state_result(result)
 
             self._post_to_ui(self._on_scan_success, result, scan_target)
 
@@ -2126,14 +2132,7 @@ class TetrisScannerApp:
         self.last_result = result
         self.pc_round_label.config(text=self.format_pc_round_info(result))
 
-        print(
-            "[STATE RESULT]",
-            "pieces_count=", result.get("pieces_count"),
-            "pc_round=", result.get("pc_round"),
-            "current=", result.get("current"),
-            "hold=", result.get("hold"),
-            "queue=", result.get("queue"),
-        )
+        self._log_state_result(result)
         scan_signature = self._make_scan_signature(result)
         same_scan = scan_signature == self.last_scan_signature
         self.last_scan_signature = scan_signature

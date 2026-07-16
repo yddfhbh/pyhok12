@@ -1,4 +1,5 @@
 import copy
+from collections import deque
 import json
 import os
 import queue
@@ -24,9 +25,16 @@ class GomenSession:
         self.proc = None
         self.stdout_queue = queue.Queue()
         self.reader_thread = None
-        self.lock = threading.Lock()
+        self.stderr_thread = None
+        self.lock = threading.RLock()
+        self.closing = False
         self.last_reader_warning = ""
         self.last_reader_warning_at = 0.0
+        self.last_exit_code = None
+        self.last_command = []
+        self.last_cwd = ""
+        self.last_stdout_lines = deque(maxlen=30)
+        self.last_stderr_lines = deque(maxlen=30)
 
     def _log_reader_warning(self, message):
         now = time.monotonic()
@@ -36,71 +44,144 @@ class GomenSession:
         self.last_reader_warning_at = now
         print(f"[gomen reader] {message}")
 
-    def ensure_started(self, timeout_sec=20):
-        if self.proc is not None and self.proc.poll() is None:
-            return
+    def _remember_stdout_line(self, line):
+        text = str(line.rstrip("\r\n"))
+        if text:
+            self.last_stdout_lines.append(text)
 
-        script_path = get_gomen_solver_path()
-        if not os.path.exists(script_path):
-            raise GomenError(f"gomen_solver.js 없음: {script_path}")
+    def _remember_stderr_line(self, line):
+        text = str(line.rstrip("\r\n"))
+        if text:
+            self.last_stderr_lines.append(text)
 
-        for asset_path in (get_gomen_js_path(), get_gomen_wasm_path(), get_legal_boards_path()):
-            if not os.path.exists(asset_path):
-                raise GomenError(f"gomen 자산 없음: {asset_path}")
-
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NO_WINDOW
-        env = os.environ.copy()
-        env["PYTHONUTF8"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        self.proc = subprocess.Popen(
-            [get_node_executable(), script_path],
-            cwd=get_tools_dir(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=creationflags,
-            env=env,
+    def _format_process_debug(self):
+        command_text = " ".join(str(part) for part in (self.last_command or [])) or "-"
+        stdout_lines = list(self.last_stdout_lines)
+        stderr_lines = list(self.last_stderr_lines)
+        stdout_text = "\n".join(stdout_lines) if stdout_lines else "-"
+        stderr_text = "\n".join(stderr_lines) if stderr_lines else "-"
+        return (
+            f"exit_code={self.last_exit_code!r}\n"
+            f"command={command_text}\n"
+            f"cwd={self.last_cwd or '-'}\n"
+            f"last_stdout_30=\n{stdout_text}\n"
+            f"last_stderr_30=\n{stderr_text}"
         )
-        self.stdout_queue = queue.Queue()
-        self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self.reader_thread.start()
+
+    def _shutdown_process_for_eof(self, proc, *, quiet=False):
+        if proc is None:
+            return None
+        exit_code = proc.poll()
+        if exit_code is not None:
+            return exit_code
+
+        if not quiet:
+            self._log_reader_warning(
+                f"stdout closed while process is still alive pid={getattr(proc, 'pid', '?')}"
+            )
+
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+        try:
+            exit_code = proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                exit_code = proc.wait(timeout=1.0)
+            except Exception:
+                exit_code = proc.poll()
+        return exit_code
+
+    def _stderr_loop(self, proc):
+        stderr = proc.stderr
+        if stderr is None:
+            return
+        try:
+            for raw_line in stderr:
+                self._remember_stderr_line(raw_line)
+        except Exception:
+            pass
+
+    def ensure_started(self, timeout_sec=20):
+        with self.lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return
+
+            script_path = get_gomen_solver_path()
+            if not os.path.exists(script_path):
+                raise GomenError(f"gomen_solver.js 없음: {script_path}")
+
+            for asset_path in (get_gomen_js_path(), get_gomen_wasm_path(), get_legal_boards_path()):
+                if not os.path.exists(asset_path):
+                    raise GomenError(f"gomen 자산 없음: {asset_path}")
+
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            command = [get_node_executable(), script_path]
+            cwd = get_tools_dir()
+
+            self.proc = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+                env=env,
+            )
+            proc = self.proc
+            self.closing = False
+            self.last_exit_code = None
+            self.last_command = list(command)
+            self.last_cwd = cwd
+            self.last_stdout_lines.clear()
+            self.last_stderr_lines.clear()
+            self.stdout_queue = queue.Queue()
+            self.reader_thread = threading.Thread(target=self._reader_loop, args=(proc,), daemon=True)
+            self.reader_thread.start()
+            self.stderr_thread = threading.Thread(target=self._stderr_loop, args=(proc,), daemon=True)
+            self.stderr_thread.start()
 
         ready = self._read_json(timeout_sec=max(10, timeout_sec))
         if ready.get("kind") != "ready":
             self.close()
-            raise GomenError(f"gomen 시작 실패: {ready}")
+            raise GomenError(f"gomen 시작 실패: {ready}\n{self._format_process_debug()}")
 
-    def _reader_loop(self):
+    def _reader_loop(self, proc):
+        stdout = proc.stdout
+        if stdout is None:
+            self.stdout_queue.put(None)
+            return
+
         try:
-            while self.proc is not None and self.proc.stdout is not None:
-                try:
-                    line = self.proc.stdout.readline()
-                except Exception as exc:
-                    self._log_reader_warning(f"stdout read failed: {exc!r}")
-                    if self.proc.poll() is not None:
-                        break
-                    time.sleep(0.05)
-                    continue
-
-                if not line:
-                    if self.proc.poll() is None:
-                        self._log_reader_warning("stdout closed without process exit; retrying")
-                        time.sleep(0.05)
-                        continue
-                    break
-
-                try:
-                    self.stdout_queue.put(line.rstrip("\r\n"))
-                except Exception as exc:
-                    self._log_reader_warning(f"stdout queue put failed: {exc!r}")
+            for line in stdout:
+                self._remember_stdout_line(line)
+                self.stdout_queue.put(line.rstrip("\r\n"))
         finally:
+            quiet = False
+            with self.lock:
+                quiet = self.closing
+            exit_code = proc.poll()
+            if exit_code is None:
+                exit_code = self._shutdown_process_for_eof(proc, quiet=quiet)
+            self.last_exit_code = exit_code
+            with self.lock:
+                if self.proc is proc:
+                    self.proc = None
             self.stdout_queue.put(None)
 
     def _read_json(self, timeout_sec=20):
@@ -111,8 +192,10 @@ class GomenSession:
 
         if line is None:
             if self.proc is not None and self.proc.poll() is not None:
-                raise GomenError("gomen 프로세스가 종료됨")
-            raise GomenError("gomen 출력 수신 실패")
+                self.last_exit_code = self.proc.poll()
+            if self.last_exit_code is not None:
+                raise GomenError(f"gomen 프로세스가 종료됨\n{self._format_process_debug()}")
+            raise GomenError(f"gomen 출력 수신 실패\n{self._format_process_debug()}")
 
         try:
             return json.loads(line)
@@ -145,8 +228,10 @@ class GomenSession:
             return response
 
     def close(self):
-        proc = self.proc
-        self.proc = None
+        with self.lock:
+            self.closing = True
+            proc = self.proc
+            self.proc = None
 
         if proc is None:
             return
@@ -164,6 +249,11 @@ class GomenSession:
                 proc.kill()
             except Exception:
                 pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        self.last_exit_code = proc.poll()
 
 
 def get_app_base_dir():
