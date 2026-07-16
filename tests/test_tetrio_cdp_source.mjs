@@ -1,17 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 
 import {
   acceptPieceCounterSource,
-  buildTombstoneSnapshot,
   buildSoloSpawnSignature,
+  buildTombstoneSnapshot,
+  captureTetrioGame,
   createSessionState,
   exposeTetrioGameFromPausedCallFrames,
+  markCurrentGameAsEnded,
   normalizeSoloPieceValue,
-  pickBetterSoloCandidate,
+  pausedFrameExposureExpression,
+  readTetrioState,
   resetSessionState,
   resolveSoloStateRevision,
   selectSoloPieceCounterCandidate,
+  shouldAdvanceGameEpoch,
+  shouldHandleEndedGame,
   updateSessionState
 } from "../browser-source/tetrio-cdp-source.mjs";
 
@@ -42,6 +48,45 @@ test("updateSessionState keeps one session until identity changes", () => {
   assert.equal(third, "session-2");
 });
 
+test("Retry after ended reset gets a new session id", () => {
+  const sessionState = createSessionState();
+
+  const first = updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  resetSessionState(sessionState);
+  const second = updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+
+  assert.equal(first, "session-1");
+  assert.equal(second, "session-2");
+});
+
+test("leaving lobby and re-entering gets a new session id", () => {
+  const sessionState = createSessionState();
+
+  const first = updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  const inactive = updateSessionState(sessionState, { playing: false });
+  const second = updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-2",
+    gameObjectId: "object-2"
+  });
+
+  assert.equal(first, "session-1");
+  assert.equal(inactive, null);
+  assert.equal(second, "session-2");
+});
+
 test("acceptPieceCounterSource rejects source changes inside one session", () => {
   const sessionState = createSessionState();
   updateSessionState(sessionState, {
@@ -54,15 +99,6 @@ test("acceptPieceCounterSource rejects source changes inside one session", () =>
   assert.equal(acceptPieceCounterSource(sessionState, "stats.piecesPlaced"), true);
   assert.equal(acceptPieceCounterSource(sessionState, "stats.piecesPlaced"), true);
   assert.equal(acceptPieceCounterSource(sessionState, "pieces"), false);
-
-  resetSessionState(sessionState);
-  updateSessionState(sessionState, {
-    playing: true,
-    roundId: "round-2",
-    gameId: "game-2",
-    gameObjectId: "object-2"
-  });
-  assert.equal(acceptPieceCounterSource(sessionState, "pieces"), true);
 });
 
 test("buildTombstoneSnapshot marks the snapshot inactive", () => {
@@ -101,17 +137,17 @@ test("normalizeSoloPieceValue handles string, object, and nested piece shapes", 
   assert.equal(normalizeSoloPieceValue({ active: { piece: { name: "tetromino_l" } } }), "L");
 });
 
-test("selectSoloPieceCounterCandidate falls back to stats.pieces and derived revision", () => {
+test("selectSoloPieceCounterCandidate keeps zero and derived revision fallback", () => {
   assert.deepEqual(
     selectSoloPieceCounterCandidate({
       state: {
         stats: {
-          pieces: 14
+          pieces: 0
         }
       }
     }),
     {
-      value: 14,
+      value: 0,
       source: "state.stats.pieces"
     }
   );
@@ -173,286 +209,261 @@ test("buildSoloSpawnSignature is stable across movement-only changes", () => {
   assert.equal(signatureA, signatureB);
 });
 
-test("pickBetterSoloCandidate does not select invalid score-zero candidates", () => {
-  assert.equal(
-    pickBetterSoloCandidate(null, {
-      path: "closure:Ai",
-      score: 0,
-      valid: false
-    }),
-    null
-  );
+test("ended-game helpers use botbot-style transition predicates", () => {
+  const endedState = {
+    ok: true,
+    ready: false,
+    reason: "TETR.IO game ended"
+  };
+  const activeState = {
+    ok: true,
+    ready: true,
+    playing: true,
+    countdown: false
+  };
+
+  assert.equal(shouldHandleEndedGame(endedState, false), true);
+  assert.equal(shouldHandleEndedGame(endedState, true), false);
+  assert.equal(shouldAdvanceGameEpoch(activeState, true), true);
+  assert.equal(shouldAdvanceGameEpoch(activeState, false), false);
 });
 
-test("exposeTetrioGameFromPausedCallFrames prefers direct object bindings over queryObjects", async () => {
+test("exposeTetrioGameFromPausedCallFrames skips Function Ai and accepts later valid frame", async () => {
   const calls = [];
   const cdp = {
     async send(method, params) {
       calls.push({ method, params });
-      if (method === "Runtime.evaluate") {
-        return { result: { value: true } };
-      }
-      if (method === "Runtime.getProperties") {
-        if (params.objectId === "scope-1") {
-          return {
-            result: [
-              {
-                name: "gameInstance",
-                value: { type: "object", objectId: "obj-game" }
-              },
-              {
-                name: "Ai",
-                value: { type: "function", objectId: "fn-ai" }
-              }
-            ]
-          };
+      if (method === "Debugger.evaluateOnCallFrame") {
+        if (params.callFrameId === "frame-1") {
+          return { result: { value: { ok: false } } };
         }
-        return { result: [] };
-      }
-      if (method === "Runtime.callFunctionOn") {
-        if (params.objectId === "obj-game" && params.returnByValue) {
-          return {
-            result: {
-              value: {
-                ok: true,
-                path: "gameInstance",
-                constructorName: "Ai",
-                ownKeys: [],
-                protoKeys: [],
-                hasEjectState: true,
-                hasEjectBoardState: true,
-                boardPath: "gameInstance.board",
-                currentPath: "gameInstance.current",
-                holdPath: "gameInstance.hold",
-                queuePath: "gameInstance.queue",
-                pieceCounterPath: "gameInstance.stats.pieces",
-                score: 14,
-                valid: true
-              }
-            }
-          };
+        if (params.callFrameId === "frame-2") {
+          return { result: { value: { ok: true, source: "closure:Ai" } } };
         }
-        return { result: { value: true } };
       }
       if (method === "Runtime.queryObjects") {
-        throw new Error("queryObjects should not run when a direct object binding is valid");
+        throw new Error("queryObjects should never be called in Solo path");
       }
       throw new Error(`unexpected ${method}`);
     }
   };
 
-  const result = await exposeTetrioGameFromPausedCallFrames(
-    cdp,
-    {
-      callFrames: [
-        {
-          scopeChain: [
-            {
-              type: "closure",
-              object: { objectId: "scope-1" }
-            }
-          ]
-        }
-      ]
-    },
-    { lastSoloQueryAt: 0 }
-  );
+  const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [{ callFrameId: "frame-1" }, { callFrameId: "frame-2" }]
+  });
 
   assert.equal(result.ok, true);
-  assert.equal(result.source, "gameInstance");
-  assert.equal(calls.some((call) => call.method === "Runtime.queryObjects"), false);
+  assert.equal(result.source, "closure:Ai");
+  assert.deepEqual(
+    calls.filter((call) => call.method === "Debugger.evaluateOnCallFrame").map((call) => call.params.callFrameId),
+    ["frame-1", "frame-2"]
+  );
 });
 
-test("exposeTetrioGameFromPausedCallFrames uses queryObjects for constructor bindings and pins the best instance", async () => {
-  const calls = [];
+test("exposeTetrioGameFromPausedCallFrames returns false when no valid frame exists", async () => {
   const cdp = {
-    async send(method, params) {
-      calls.push({ method, params });
-      if (method === "Runtime.evaluate") {
-        return { result: { value: true } };
-      }
-      if (method === "Runtime.getProperties") {
-        if (params.objectId === "scope-2") {
-          return {
-            result: [
-              {
-                name: "Ai",
-                value: { type: "function", objectId: "fn-ai" }
-              }
-            ]
-          };
-        }
-        if (params.objectId === "fn-ai") {
-          return {
-            result: [
-              {
-                name: "prototype",
-                value: { type: "object", objectId: "proto-ai" }
-              }
-            ]
-          };
-        }
-        if (params.objectId === "query-array") {
-          return {
-            result: [
-              {
-                name: "0",
-                value: { type: "object", objectId: "inst-0" }
-              },
-              {
-                name: "1",
-                value: { type: "object", objectId: "inst-1" }
-              }
-            ]
-          };
-        }
-        return { result: [] };
+    async send(method) {
+      if (method === "Debugger.evaluateOnCallFrame") {
+        return { result: { value: { ok: false } } };
       }
       if (method === "Runtime.queryObjects") {
-        return {
-          objects: { objectId: "query-array" }
-        };
-      }
-      if (method === "Runtime.callFunctionOn") {
-        if (params.objectId === "inst-0" && params.returnByValue) {
-          return {
-            result: {
-              value: {
-                ok: true,
-                path: "queryObjects(Ai.prototype)[0]",
-                constructorName: "Ai",
-                ownKeys: [],
-                protoKeys: [],
-                hasEjectState: false,
-                hasEjectBoardState: false,
-                boardPath: "",
-                currentPath: "",
-                holdPath: "",
-                queuePath: "",
-                pieceCounterPath: "",
-                score: 0,
-                valid: false
-              }
-            }
-          };
-        }
-        if (params.objectId === "inst-1" && params.returnByValue) {
-          return {
-            result: {
-              value: {
-                ok: true,
-                path: "queryObjects(Ai.prototype)[1]",
-                constructorName: "Ai",
-                ownKeys: [],
-                protoKeys: [],
-                hasEjectState: true,
-                hasEjectBoardState: true,
-                boardPath: "ejectBoardState().b",
-                currentPath: "ejectState().falling.type",
-                holdPath: "ejectState().hold",
-                queuePath: "ejectState().bag",
-                pieceCounterPath: "ejectState().stats.pieces",
-                score: 15,
-                valid: true
-              }
-            }
-          };
-        }
-        return { result: { value: true } };
+        throw new Error("queryObjects should never be called in Solo path");
       }
       throw new Error(`unexpected ${method}`);
     }
   };
 
-  const result = await exposeTetrioGameFromPausedCallFrames(
-    cdp,
-    {
-      callFrames: [
-        {
-          scopeChain: [
-            {
-              type: "closure",
-              object: { objectId: "scope-2" }
-            }
-          ]
+  const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [{ callFrameId: "frame-1" }]
+  });
+
+  assert.equal(result.ok, false);
+});
+
+test("captureTetrioGame resumes every paused event and still runs finally cleanup on success", async () => {
+  const calls = [];
+  const pausedEvents = [
+    { callFrames: [{ callFrameId: "frame-1" }] },
+    { callFrames: [{ callFrameId: "frame-2" }] }
+  ];
+  const cdp = {
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") {
+        return { result: { objectId: `${params.expression}-id` } };
+      }
+      if (method === "Debugger.setBreakpointOnFunctionCall") {
+        return { breakpointId: `bp-${params.objectId}` };
+      }
+      if (method === "Debugger.evaluateOnCallFrame") {
+        if (params.callFrameId === "frame-1") {
+          return { result: { value: { ok: false } } };
         }
-      ]
+        return { result: { value: { ok: true, source: "closure:Ai" } } };
+      }
+      if (
+        method === "Debugger.enable" ||
+        method === "Debugger.resume" ||
+        method === "Debugger.removeBreakpoint" ||
+        method === "Runtime.releaseObjectGroup" ||
+        method === "Debugger.disable"
+      ) {
+        return {};
+      }
+      if (method === "Runtime.queryObjects") {
+        throw new Error("queryObjects should never be called in Solo path");
+      }
+      throw new Error(`unexpected ${method}`);
     },
-    { lastSoloQueryAt: 0 }
-  );
+    async waitForEvent(method) {
+      assert.equal(method, "Debugger.paused");
+      const next = pausedEvents.shift();
+      if (!next) {
+        throw new Error("Timed out waiting for CDP event Debugger.paused");
+      }
+      return next;
+    }
+  };
+
+  const result = await captureTetrioGame(cdp);
 
   assert.equal(result.ok, true);
-  assert.equal(result.source, "queryObjects(Ai.prototype)[1]");
-  assert.equal(calls.some((call) => call.method === "Runtime.queryObjects"), true);
+  assert.equal(result.source, "closure:Ai");
+  assert.equal(calls.filter((call) => call.method === "Debugger.resume").length, 2);
+  assert.equal(calls.filter((call) => call.method === "Debugger.removeBreakpoint").length, 2);
   assert.equal(
     calls.some(
       (call) =>
-        call.method === "Runtime.callFunctionOn" &&
-        call.params.objectId === "inst-1" &&
-        Array.isArray(call.params.arguments)
+        call.method === "Runtime.releaseObjectGroup" &&
+        call.params?.objectGroup === "fusion-tetrio-probe"
     ),
     true
   );
+  assert.equal(calls.some((call) => call.method === "Debugger.disable"), true);
 });
 
-test("exposeTetrioGameFromPausedCallFrames survives empty queryObjects results", async () => {
+test("captureTetrioGame cleans up breakpoints and debugger on failure", async () => {
+  const calls = [];
+  const cdp = {
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") {
+        return { result: { objectId: `${params.expression}-id` } };
+      }
+      if (method === "Debugger.setBreakpointOnFunctionCall") {
+        return { breakpointId: `bp-${params.objectId}` };
+      }
+      if (
+        method === "Debugger.enable" ||
+        method === "Debugger.removeBreakpoint" ||
+        method === "Runtime.releaseObjectGroup" ||
+        method === "Debugger.disable"
+      ) {
+        return {};
+      }
+      if (method === "Runtime.queryObjects") {
+        throw new Error("queryObjects should never be called in Solo path");
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+    async waitForEvent() {
+      throw new Error("Timed out waiting for CDP event Debugger.paused");
+    }
+  };
+
+  const result = await captureTetrioGame(cdp);
+
+  assert.equal(result.ok, false);
+  assert.equal(calls.filter((call) => call.method === "Debugger.removeBreakpoint").length, 2);
+  assert.equal(calls.some((call) => call.method === "Debugger.disable"), true);
+});
+
+test("readTetrioState does not probe with debugger after a valid cached game state exists", async () => {
+  let captureCalled = false;
+  const cdp = {
+    async send(method) {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              ok: true,
+              ready: true,
+              playing: true,
+              countdown: false,
+              field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+              current: "t",
+              hold: "i",
+              queue: ["l", "s", "o"],
+              pieceCounter: 0,
+              pieceCounterSource: "state.stats.pieces",
+              gameId: "solo-1",
+              roundId: "round-1",
+              gameObjectId: "object-1"
+            }
+          }
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  };
+
+  const state = await readTetrioState(cdp, {
+    probePageState: true,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: "" },
+    probeState: { lastCaptureAt: 0 },
+    captureGameFn: async () => {
+      captureCalled = true;
+      return { ok: true, source: "closure:Ai" };
+    }
+  });
+
+  assert.equal(state.ok, true);
+  assert.equal(state.pieceCounter, 0);
+  assert.equal(captureCalled, false);
+});
+
+test("markCurrentGameAsEnded keeps ended cache and removes live cache only", async () => {
+  let expression = "";
   const cdp = {
     async send(method, params) {
       if (method === "Runtime.evaluate") {
-        return { result: { value: true } };
-      }
-      if (method === "Runtime.getProperties") {
-        if (params.objectId === "scope-3") {
-          return {
-            result: [
-              {
-                name: "Ai",
-                value: { type: "function", objectId: "fn-ai" }
-              }
-            ]
-          };
-        }
-        if (params.objectId === "fn-ai") {
-          return {
-            result: [
-              {
-                name: "prototype",
-                value: { type: "object", objectId: "proto-ai" }
-              }
-            ]
-          };
-        }
-        if (params.objectId === "query-empty") {
-          return { result: [] };
-        }
-        return { result: [] };
-      }
-      if (method === "Runtime.queryObjects") {
-        return { objects: { objectId: "query-empty" } };
-      }
-      if (method === "Runtime.callFunctionOn") {
+        expression = params.expression;
         return { result: { value: true } };
       }
       throw new Error(`unexpected ${method}`);
     }
   };
 
-  const result = await exposeTetrioGameFromPausedCallFrames(
-    cdp,
-    {
-      callFrames: [
-        {
-          scopeChain: [
-            {
-              type: "closure",
-              object: { objectId: "scope-3" }
-            }
-          ]
-        }
-      ]
+  await markCurrentGameAsEnded(cdp);
+
+  assert.match(expression, /__fusionEndedTetrioGame/);
+  assert.match(expression, /delete window.__fusionTetrioGame/);
+  assert.doesNotMatch(expression, /__fusionSoloRootCandidate/);
+});
+
+test("pausedFrameExposureExpression rejects stale ended object reuse", () => {
+  const staleGame = {
+    ejectState() {
+      return { game: { gameover: true } };
     },
-    { lastSoloQueryAt: 0 }
-  );
+    ejectBoardState() {
+      return { b: [] };
+    }
+  };
+  const context = {
+    Ai: staleGame,
+    window: {
+      __fusionEndedTetrioGame: staleGame
+    },
+    location: {
+      href: "https://tetr.io/"
+    },
+    Date
+  };
+
+  const result = vm.runInNewContext(pausedFrameExposureExpression(), context);
 
   assert.equal(result.ok, false);
+  assert.equal("__fusionTetrioGame" in context.window, false);
 });
