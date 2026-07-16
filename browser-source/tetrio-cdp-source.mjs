@@ -422,11 +422,11 @@ async function main() {
   let ownsChromium = false;
   const alreadyOpen = await isCdpOpen(port);
   if (determineChromiumOwnership({ connectOnly, alreadyOpen })) {
-    browserProcess = launchChromium({ port, url, chromePath });
+    browserProcess = await launchChromium({ port, url, chromePath });
     ownsChromium = true;
+  } else {
+    await waitForCdpReady(port);
   }
-
-  await waitForCdpReady(port);
   const target = await findOrCreateTarget({ port, url, targetHint });
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);

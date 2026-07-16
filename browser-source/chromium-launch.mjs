@@ -1,53 +1,103 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 export const DEFAULT_URL = "https://tetr.io/";
 export const DEFAULT_PORT = 9222;
+export const DEFAULT_PROFILE_DIR = "C:\\pyhok12-cdp-profile";
 
-export function resolveChromePath(chromePath = "") {
-  const explicit = `${chromePath}`.trim();
-  if (explicit) {
-    return explicit;
+export function getChromeCandidatePaths(env = process.env) {
+  const candidates = [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+  ];
+  const localAppData = `${env?.LOCALAPPDATA ?? ""}`.trim();
+  if (localAppData) {
+    candidates.push(path.win32.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"));
   }
-  return findChromiumExecutable();
+  return candidates;
 }
 
-export function buildChromeArgs({ port = DEFAULT_PORT, url = DEFAULT_URL, profileDir }) {
+export function resolveChromePath(
+  chromePath = "",
+  { env = process.env, existsSyncImpl = existsSync } = {}
+) {
+  const explicit = `${chromePath}`.trim();
+  if (explicit) {
+    return {
+      executable: explicit,
+      attemptedPaths: [explicit]
+    };
+  }
+
+  const attemptedPaths = getChromeCandidatePaths(env);
+  const executable = attemptedPaths.find((candidate) => existsSyncImpl(candidate)) ?? null;
+  return {
+    executable,
+    attemptedPaths
+  };
+}
+
+export function buildChromeArgs({
+  port = DEFAULT_PORT,
+  url = DEFAULT_URL,
+  profileDir = DEFAULT_PROFILE_DIR
+}) {
   return [
     `--remote-debugging-port=${port}`,
     "--remote-allow-origins=*",
     `--user-data-dir=${profileDir}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-background-timer-throttling",
-    "--disable-renderer-backgrounding",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-features=Translate,CalculateNativeWinOcclusion",
     url
   ];
 }
 
-export function launchChromium({
+export async function launchChromium({
   port = DEFAULT_PORT,
   url = DEFAULT_URL,
   chromePath = "",
-  profileDir,
-  spawnImpl = spawn
+  profileDir = DEFAULT_PROFILE_DIR,
+  spawnImpl = spawn,
+  env = process.env,
+  existsSyncImpl = existsSync,
+  fetchImpl = fetch,
+  sleepImpl = sleep,
+  timeoutMs = 10000
 }) {
-  const executable = resolveChromePath(chromePath);
-  if (!executable) {
-    throw new Error("Could not find Chrome/Edge. Set CHROME_PATH to the browser executable.");
-  }
-  const resolvedProfileDir = profileDir || path.join(os.tmpdir(), `botbot-tetrio-cdp-${port}`);
-  mkdirSync(resolvedProfileDir, { recursive: true });
-  const browserProcess = spawnImpl(executable, buildChromeArgs({ port, url, profileDir: resolvedProfileDir }), {
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"]
+  const { executable, attemptedPaths } = resolveChromePath(chromePath, {
+    env,
+    existsSyncImpl
   });
+  if (!executable) {
+    throw new Error(`Chrome auto-launch failed. Tried: ${attemptedPaths.join(" | ")}`);
+  }
+  mkdirSync(profileDir, { recursive: true });
+
+  let browserProcess;
+  try {
+    browserProcess = spawnImpl(executable, buildChromeArgs({ port, url, profileDir }), {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"]
+    });
+  } catch (error) {
+    throw new Error(
+      `Chrome auto-launch failed. Executable: ${executable}. spawn error: ${error?.message ?? String(error)}`
+    );
+  }
+
+  await waitForSpawn(browserProcess, executable);
   // Keep the debugging browser alive even if the helper process restarts.
   browserProcess.unref();
+  try {
+    await waitForCdpReady(port, {
+      timeoutMs,
+      fetchImpl,
+      sleepImpl
+    });
+  } catch (error) {
+    throw new Error(
+      `Chrome auto-launch failed. Executable: ${executable}. ${error?.message ?? String(error)}`
+    );
+  }
   return browserProcess;
 }
 
@@ -63,7 +113,7 @@ export async function isCdpOpen(port, fetchImpl = fetch) {
 export async function waitForCdpReady(
   port,
   {
-    timeoutMs = 15000,
+    timeoutMs = 10000,
     fetchImpl = fetch,
     sleepImpl = sleep
   } = {}
@@ -113,16 +163,46 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 }
 
-function findChromiumExecutable() {
-  const localAppData = process.env.LOCALAPPDATA;
-  const programFiles = process.env.ProgramFiles;
-  const programFilesX86 = process.env["ProgramFiles(x86)"];
-  const candidates = [
-    programFiles && path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
-    programFilesX86 && path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-    localAppData && path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
-    programFiles && path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
-    programFilesX86 && path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe")
-  ].filter(Boolean);
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+function waitForSpawn(browserProcess, executable) {
+  return new Promise((resolve, reject) => {
+    if (!browserProcess) {
+      reject(new Error(`Chrome auto-launch failed. Executable: ${executable}. spawn error: unknown`));
+      return;
+    }
+
+    let settled = false;
+    const finishResolve = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(browserProcess);
+    };
+    const finishReject = (message) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(new Error(`Chrome auto-launch failed. Executable: ${executable}. spawn error: ${message}`));
+    };
+    const onSpawn = () => finishResolve();
+    const onError = (error) => finishReject(error?.message ?? String(error));
+    const onExit = (code, signal) =>
+      finishReject(`process exited before CDP opened (code=${code ?? "null"} signal=${signal ?? "null"})`);
+    const cleanup = () => {
+      browserProcess.off?.("spawn", onSpawn);
+      browserProcess.off?.("error", onError);
+      browserProcess.off?.("exit", onExit);
+    };
+
+    browserProcess.once?.("spawn", onSpawn);
+    browserProcess.once?.("error", onError);
+    browserProcess.once?.("exit", onExit);
+
+    if (typeof browserProcess.pid === "number" && browserProcess.pid > 0) {
+      queueMicrotask(finishResolve);
+    }
+  });
 }
