@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 
-debug_screenshot.png
 *.log
+node_modules/
+runtime/
+*.tmp
 
 Setup Konbini.xlsx
 

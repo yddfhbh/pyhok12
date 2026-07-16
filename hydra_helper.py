@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+from app_paths import get_resource_path
+
 
 VALID_PIECES = set("IJLOSTZ")
 PIECE_PRIORITY = "IJLOSTZ"
@@ -162,13 +164,11 @@ class HydraSession:
 
 
 def get_app_base_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    return str(get_resource_path())
 
 
 def get_hydra_dir():
-    return os.path.join(get_app_base_dir(), "tools", "hydra")
+    return str(get_resource_path("tools", "hydra"))
 
 
 def get_hydra_exe_path():

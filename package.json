@@ -1,0 +1,8 @@
+{
+  "name": "pyhok12-tetrio-cdp",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "msgpackr": "^2.0.4"
+  }
+}
