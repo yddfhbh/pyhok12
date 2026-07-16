@@ -6,7 +6,9 @@ import {
   buildTombstoneSnapshot,
   buildSoloSpawnSignature,
   createSessionState,
+  exposeTetrioGameFromPausedCallFrames,
   normalizeSoloPieceValue,
+  pickBetterSoloCandidate,
   resetSessionState,
   resolveSoloStateRevision,
   selectSoloPieceCounterCandidate,
@@ -169,4 +171,288 @@ test("buildSoloSpawnSignature is stable across movement-only changes", () => {
   });
 
   assert.equal(signatureA, signatureB);
+});
+
+test("pickBetterSoloCandidate does not select invalid score-zero candidates", () => {
+  assert.equal(
+    pickBetterSoloCandidate(null, {
+      path: "closure:Ai",
+      score: 0,
+      valid: false
+    }),
+    null
+  );
+});
+
+test("exposeTetrioGameFromPausedCallFrames prefers direct object bindings over queryObjects", async () => {
+  const calls = [];
+  const cdp = {
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") {
+        return { result: { value: true } };
+      }
+      if (method === "Runtime.getProperties") {
+        if (params.objectId === "scope-1") {
+          return {
+            result: [
+              {
+                name: "gameInstance",
+                value: { type: "object", objectId: "obj-game" }
+              },
+              {
+                name: "Ai",
+                value: { type: "function", objectId: "fn-ai" }
+              }
+            ]
+          };
+        }
+        return { result: [] };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        if (params.objectId === "obj-game" && params.returnByValue) {
+          return {
+            result: {
+              value: {
+                ok: true,
+                path: "gameInstance",
+                constructorName: "Ai",
+                ownKeys: [],
+                protoKeys: [],
+                hasEjectState: true,
+                hasEjectBoardState: true,
+                boardPath: "gameInstance.board",
+                currentPath: "gameInstance.current",
+                holdPath: "gameInstance.hold",
+                queuePath: "gameInstance.queue",
+                pieceCounterPath: "gameInstance.stats.pieces",
+                score: 14,
+                valid: true
+              }
+            }
+          };
+        }
+        return { result: { value: true } };
+      }
+      if (method === "Runtime.queryObjects") {
+        throw new Error("queryObjects should not run when a direct object binding is valid");
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(
+    cdp,
+    {
+      callFrames: [
+        {
+          scopeChain: [
+            {
+              type: "closure",
+              object: { objectId: "scope-1" }
+            }
+          ]
+        }
+      ]
+    },
+    { lastSoloQueryAt: 0 }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "gameInstance");
+  assert.equal(calls.some((call) => call.method === "Runtime.queryObjects"), false);
+});
+
+test("exposeTetrioGameFromPausedCallFrames uses queryObjects for constructor bindings and pins the best instance", async () => {
+  const calls = [];
+  const cdp = {
+    async send(method, params) {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") {
+        return { result: { value: true } };
+      }
+      if (method === "Runtime.getProperties") {
+        if (params.objectId === "scope-2") {
+          return {
+            result: [
+              {
+                name: "Ai",
+                value: { type: "function", objectId: "fn-ai" }
+              }
+            ]
+          };
+        }
+        if (params.objectId === "fn-ai") {
+          return {
+            result: [
+              {
+                name: "prototype",
+                value: { type: "object", objectId: "proto-ai" }
+              }
+            ]
+          };
+        }
+        if (params.objectId === "query-array") {
+          return {
+            result: [
+              {
+                name: "0",
+                value: { type: "object", objectId: "inst-0" }
+              },
+              {
+                name: "1",
+                value: { type: "object", objectId: "inst-1" }
+              }
+            ]
+          };
+        }
+        return { result: [] };
+      }
+      if (method === "Runtime.queryObjects") {
+        return {
+          objects: { objectId: "query-array" }
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        if (params.objectId === "inst-0" && params.returnByValue) {
+          return {
+            result: {
+              value: {
+                ok: true,
+                path: "queryObjects(Ai.prototype)[0]",
+                constructorName: "Ai",
+                ownKeys: [],
+                protoKeys: [],
+                hasEjectState: false,
+                hasEjectBoardState: false,
+                boardPath: "",
+                currentPath: "",
+                holdPath: "",
+                queuePath: "",
+                pieceCounterPath: "",
+                score: 0,
+                valid: false
+              }
+            }
+          };
+        }
+        if (params.objectId === "inst-1" && params.returnByValue) {
+          return {
+            result: {
+              value: {
+                ok: true,
+                path: "queryObjects(Ai.prototype)[1]",
+                constructorName: "Ai",
+                ownKeys: [],
+                protoKeys: [],
+                hasEjectState: true,
+                hasEjectBoardState: true,
+                boardPath: "ejectBoardState().b",
+                currentPath: "ejectState().falling.type",
+                holdPath: "ejectState().hold",
+                queuePath: "ejectState().bag",
+                pieceCounterPath: "ejectState().stats.pieces",
+                score: 15,
+                valid: true
+              }
+            }
+          };
+        }
+        return { result: { value: true } };
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(
+    cdp,
+    {
+      callFrames: [
+        {
+          scopeChain: [
+            {
+              type: "closure",
+              object: { objectId: "scope-2" }
+            }
+          ]
+        }
+      ]
+    },
+    { lastSoloQueryAt: 0 }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "queryObjects(Ai.prototype)[1]");
+  assert.equal(calls.some((call) => call.method === "Runtime.queryObjects"), true);
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.method === "Runtime.callFunctionOn" &&
+        call.params.objectId === "inst-1" &&
+        Array.isArray(call.params.arguments)
+    ),
+    true
+  );
+});
+
+test("exposeTetrioGameFromPausedCallFrames survives empty queryObjects results", async () => {
+  const cdp = {
+    async send(method, params) {
+      if (method === "Runtime.evaluate") {
+        return { result: { value: true } };
+      }
+      if (method === "Runtime.getProperties") {
+        if (params.objectId === "scope-3") {
+          return {
+            result: [
+              {
+                name: "Ai",
+                value: { type: "function", objectId: "fn-ai" }
+              }
+            ]
+          };
+        }
+        if (params.objectId === "fn-ai") {
+          return {
+            result: [
+              {
+                name: "prototype",
+                value: { type: "object", objectId: "proto-ai" }
+              }
+            ]
+          };
+        }
+        if (params.objectId === "query-empty") {
+          return { result: [] };
+        }
+        return { result: [] };
+      }
+      if (method === "Runtime.queryObjects") {
+        return { objects: { objectId: "query-empty" } };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        return { result: { value: true } };
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(
+    cdp,
+    {
+      callFrames: [
+        {
+          scopeChain: [
+            {
+              type: "closure",
+              object: { objectId: "scope-3" }
+            }
+          ]
+        }
+      ]
+    },
+    { lastSoloQueryAt: 0 }
+  );
+
+  assert.equal(result.ok, false);
 });
