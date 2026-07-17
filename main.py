@@ -1028,7 +1028,7 @@ class TetrisScannerApp:
 
     def build_pc_variant(self, index, title, solution, queue_text):
         rows = self.decode_gomen_cells(solution.get("cells", ""))
-        queue_value = str(queue_text or "").strip().upper()
+        queue_value = str(solution.get("queue_text") or queue_text or "").strip().upper()
         if not queue_value:
             return None
 
@@ -1057,7 +1057,8 @@ class TetrisScannerApp:
                 )
                 if not variant:
                     continue
-                variant["state_queue"] = state_queue
+                variant["state_queue"] = str(solution.get("state_queue") or state_queue).strip().upper()
+                variant["branch_name"] = str(solution.get("branch_name") or "")
                 variant["matched_group"] = solution.get("matched_group") or ""
                 variants.append(variant)
 
