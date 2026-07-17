@@ -939,14 +939,14 @@ class TetrisScannerApp:
         self.current_output_mode = "pc_solve"
 
         card_width = 260
-        card_height = 128
-        gap_y = 12
+        card_height = 98
+        gap_y = 8
         start_x = 8
-        start_y = self.draw_output_context_header(solver_result=solver_result)
+        start_y = 8
         visible = variants[:6]
         for index, variant in enumerate(visible):
             y = start_y + index * (card_height + gap_y)
-            self.draw_pc_solution_card_exact(start_x, y, card_width, card_height, variant)
+            self.draw_pc_solution_card_minimal(start_x, y, card_width, card_height, variant)
 
         bottom = start_y + len(visible) * (card_height + gap_y)
         self.output.config(
@@ -977,6 +977,27 @@ class TetrisScannerApp:
             fill="#252525",
             font=("Consolas", 10, "bold"),
         )
+
+        if hold_start:
+            badge_x1 = x + 34
+            badge_y1 = y + 6
+            badge_x2 = badge_x1 + 58
+            badge_y2 = badge_y1 + 16
+            self.output.create_rectangle(
+                badge_x1,
+                badge_y1,
+                badge_x2,
+                badge_y2,
+                fill="#e8dfc9",
+                outline="#cdbf9d",
+            )
+            self.output.create_text(
+                (badge_x1 + badge_x2) / 2,
+                (badge_y1 + badge_y2) / 2 + 0.5,
+                text="HOLD 시작",
+                fill="#6a5430",
+                font=("Malgun Gothic", 7, "bold"),
+            )
 
         if preview_rows:
             self.draw_site_preview_board(preview_rows, x + 10, y + 22, scale=0.55)
@@ -1038,7 +1059,7 @@ class TetrisScannerApp:
         }
 
     def build_pc_solver_variants(self, solver_result, active="", hold=""):
-        return self.build_pc_solver_variants_exact(solver_result, active=active, hold=hold)
+        return self.build_pc_solver_variants_minimal(solver_result, active=active, hold=hold)
 
         variants = []
         solutions = solver_result.get("solutions") or []
@@ -1066,10 +1087,7 @@ class TetrisScannerApp:
     def draw_pc_solution_card_exact(self, x, y, width, height, variant):
         title = variant.get("title") or "PC 해법"
         preview_rows = variant.get("preview_rows") or []
-        next_text = variant.get("next_text") or ""
-        placements_text = variant.get("placements_text") or ""
-        first_move_text = variant.get("first_move_text") or "-"
-        final_hold = variant.get("final_hold") or "-"
+        hold_start = bool(variant.get("hold_start"))
 
         self.output.create_rectangle(
             x,
@@ -1100,40 +1118,6 @@ class TetrisScannerApp:
                 font=("Malgun Gothic", 8, "bold"),
             )
 
-        self.output.create_text(
-            x + 120,
-            y + 30,
-            text="NEXT",
-            anchor="w",
-            fill="#7a766d",
-            font=("Consolas", 8, "bold"),
-        )
-        self.draw_piece_strip(next_text, x + 120, y + 38, block_size=14, gap=2)
-        self.output.create_text(
-            x + 120,
-            y + 66,
-            text="ORDER",
-            anchor="w",
-            fill="#7a766d",
-            font=("Consolas", 8, "bold"),
-        )
-        self.draw_piece_strip(placements_text, x + 120, y + 74, block_size=12, gap=2)
-        self.output.create_text(
-            x + 120,
-            y + 100,
-            text=first_move_text,
-            anchor="w",
-            fill="#252525",
-            font=("Malgun Gothic", 8, "bold"),
-        )
-        self.output.create_text(
-            x + 120,
-            y + 118,
-            text=f"FINAL HOLD {final_hold}",
-            anchor="w",
-            fill="#252525",
-            font=("Consolas", 8, "bold"),
-        )
 
     def build_pc_variant_exact(self, index, title, solution, next_text):
         rows = self.decode_gomen_cells(solution.get("cells", ""))
@@ -1142,7 +1126,6 @@ class TetrisScannerApp:
         if not placements:
             return None
 
-        first_piece = placements[0]
         first_hold = bool(hold_actions[0]) if hold_actions else False
         first_move_text = f"첫 수: HOLD → {first_piece} 사용" if first_hold else f"첫 수: {first_piece} 그대로 사용"
         return {
@@ -1168,6 +1151,91 @@ class TetrisScannerApp:
                 solution=solution,
                 next_text=next_text,
             )
+            if not variant:
+                continue
+            variant["state_queue"] = str(solution.get("state_queue") or state_queue).strip().upper()
+            variant["branch_name"] = str(solution.get("branch_name") or "")
+            variant["matched_group"] = solution.get("matched_group") or ""
+            variants.append(variant)
+
+        return variants
+
+    def draw_pc_solution_card_minimal(self, x, y, width, height, variant):
+        title = variant.get("title") or "1."
+        preview_rows = variant.get("preview_rows") or []
+        hold_start = bool(variant.get("hold_start"))
+
+        self.output.create_rectangle(
+            x,
+            y,
+            x + width,
+            y + height,
+            fill="#f4f1e8",
+            outline="#dfd9ca",
+        )
+        self.output.create_text(
+            x + 10,
+            y + 12,
+            text=title,
+            anchor="w",
+            fill="#252525",
+            font=("Consolas", 10, "bold"),
+        )
+
+        if hold_start:
+            badge_x1 = x + 34
+            badge_y1 = y + 6
+            badge_x2 = badge_x1 + 58
+            badge_y2 = badge_y1 + 16
+            self.output.create_rectangle(
+                badge_x1,
+                badge_y1,
+                badge_x2,
+                badge_y2,
+                fill="#e8dfc9",
+                outline="#cdbf9d",
+            )
+            self.output.create_text(
+                (badge_x1 + badge_x2) / 2,
+                (badge_y1 + badge_y2) / 2 + 0.5,
+                text="HOLD 시작",
+                fill="#6a5430",
+                font=("Malgun Gothic", 7, "bold"),
+            )
+
+        if preview_rows:
+            self.draw_site_preview_board(preview_rows, x + 10, y + 22, scale=0.55)
+        else:
+            self.output.create_text(
+                x + 10,
+                y + 46,
+                text="배치 미리보기 없음",
+                anchor="w",
+                fill="#8f6f4a",
+                font=("Malgun Gothic", 8, "bold"),
+            )
+
+    def build_pc_variant_minimal(self, index, solution):
+        rows = self.decode_gomen_cells(solution.get("cells", ""))
+        placements = [str(piece or "").strip().upper() for piece in (solution.get("placements") or []) if piece]
+        hold_actions = [bool(value) for value in (solution.get("hold_actions") or [])]
+        if not placements:
+            return None
+
+        return {
+            "title": f"{index}.",
+            "preview_rows": rows,
+            "hold_start": bool(hold_actions[0]) if hold_actions else False,
+            "solution": solution,
+        }
+
+    def build_pc_solver_variants_minimal(self, solver_result, active="", hold=""):
+        variants = []
+        solutions = solver_result.get("solutions") or []
+        state_queue = str(solver_result.get("state_queue") or "").strip().upper()
+
+        for index, solution in enumerate(solutions[:6], start=1):
+            variant = self.build_pc_variant_minimal(index=index, solution=solution)
             if not variant:
                 continue
             variant["state_queue"] = str(solution.get("state_queue") or state_queue).strip().upper()

@@ -89,6 +89,13 @@ class MainUiTests(unittest.TestCase):
         for patcher in reversed(self.patchers):
             patcher.stop()
 
+    def get_canvas_texts(self):
+        texts = []
+        for item_id in self.app.output.find_all():
+            if self.app.output.type(item_id) == "text":
+                texts.append(self.app.output.itemcget(item_id, "text"))
+        return texts
+
     def test_hydra_controls_are_removed_and_action_buttons_remain(self):
         self.assertFalse(hasattr(self.app, "hydra_frame"))
         self.assertFalse(hasattr(self.app, "active_var"))
@@ -170,6 +177,63 @@ class MainUiTests(unittest.TestCase):
         render_mock.assert_called_once_with(result["variants"], solver_result=result)
         self.assertEqual(self.app.pc_solver_status_var.get(), "PC SOLVER: 해법 1개")
         self.assertEqual(self.app.status_label.cget("text"), "PC 해법 계산 완료")
+
+    def test_build_pc_solver_variants_minimal_marks_hold_start_only(self):
+        result = {
+            "state_queue": "SOIZJLL",
+            "solutions": [
+                {
+                    "cells": "." * 40,
+                    "placements": ["S", "O", "I"],
+                    "hold_actions": [False, False, False],
+                    "final_hold": "T",
+                },
+                {
+                    "cells": "." * 40,
+                    "placements": ["T", "O", "I"],
+                    "hold_actions": [True, False, False],
+                    "final_hold": "S",
+                },
+            ],
+        }
+
+        variants = self.app.build_pc_solver_variants(result, active="S", hold="T")
+
+        self.assertEqual([variant["title"] for variant in variants], ["1.", "2."])
+        self.assertFalse(variants[0]["hold_start"])
+        self.assertTrue(variants[1]["hold_start"])
+        self.assertIn("solution", variants[0])
+        self.assertNotIn("next_text", variants[0])
+        self.assertNotIn("placements_text", variants[0])
+        self.assertNotIn("first_move_text", variants[0])
+        self.assertNotIn("final_hold", variants[0])
+
+    def test_render_pc_solution_groups_hides_header_and_debug_text(self):
+        self.app.last_result = make_result(current="S", hold="T", queue=["O", "I", "Z", "J", "L", "L"])
+        variants = [
+            {
+                "title": "1.",
+                "preview_rows": [".........." for _ in range(4)],
+                "hold_start": False,
+            },
+            {
+                "title": "2.",
+                "preview_rows": [".........." for _ in range(4)],
+                "hold_start": True,
+            },
+        ]
+
+        self.app.render_pc_solution_groups(variants, solver_result={"state_queue": "SOIZJLL"})
+        texts = self.get_canvas_texts()
+
+        self.assertIn("1.", texts)
+        self.assertIn("2.", texts)
+        self.assertTrue(any("HOLD" in text for text in texts))
+        self.assertFalse(any("ACTIVE" in text for text in texts))
+        self.assertFalse(any("NEXT" in text for text in texts))
+        self.assertFalse(any("STATE" in text for text in texts))
+        self.assertFalse(any("ORDER" in text for text in texts))
+        self.assertFalse(any("첫 수:" in text for text in texts))
 
     def test_pc_solver_success_reports_no_solutions(self):
         self.app._on_pc_solver_success(
