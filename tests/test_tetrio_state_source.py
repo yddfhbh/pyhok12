@@ -506,7 +506,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertFalse(source.browser_connected)
             self.assertFalse(source.last_ready)
 
-    def test_actual_exit_restarts_helper_once(self):
+    def test_actual_exit_does_not_restart_helper_automatically(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             snapshot_path = Path(tmpdir) / "live-snapshot.json"
             source = make_state_source(snapshot_path)
@@ -518,44 +518,35 @@ class TetrioStateSourceTests(unittest.TestCase):
             source.proc.set_exit_code(1)
             reader.join(1.0)
 
-            source.next_restart_allowed_at = time.time() - 0.1
-            spawned = BlockingProc(stdout_lines=[])
-            with mock.patch("subprocess.Popen", return_value=spawned) as popen:
-                source.start = TetrioStateSource.start.__get__(source, TetrioStateSource)
-                source._ensure_running = TetrioStateSource._ensure_running.__get__(source, TetrioStateSource)
+            with mock.patch("subprocess.Popen") as popen:
                 status = source.get_status()
 
-            self.assertEqual(popen.call_count, 1)
-            self.assertEqual(len(source.restart_times), 1)
-            self.assertEqual(status["browser_status"], "Connecting")
-            spawned.set_exit_code(0)
+            popen.assert_not_called()
+            self.assertEqual(status["browser_status"], "Disconnected")
+            self.assertIn("브라우저 연결 끊김", status["detail"])
 
-    def test_concurrent_get_status_starts_single_helper(self):
+    def test_concurrent_get_status_does_not_start_helper(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             snapshot_path = Path(tmpdir) / "live-snapshot.json"
             source = make_state_source(snapshot_path)
             source.proc = None
             source.browser_connected = False
             source.last_ready = False
-            source.start = TetrioStateSource.start.__get__(source, TetrioStateSource)
-            source._ensure_running = TetrioStateSource._ensure_running.__get__(source, TetrioStateSource)
-
-            spawned = BlockingProc(stdout_lines=[])
             results = []
 
             def call_status():
                 results.append(source.get_status())
 
-            with mock.patch("subprocess.Popen", return_value=spawned) as popen:
+            with mock.patch("subprocess.Popen") as popen:
                 threads = [threading.Thread(target=call_status) for _ in range(8)]
                 for thread in threads:
                     thread.start()
                 for thread in threads:
                     thread.join()
 
-            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(popen.call_count, 0)
             self.assertEqual(len(results), 8)
-            spawned.set_exit_code(0)
+            self.assertTrue(all(result["browser_status"] == "Disconnected" for result in results))
 
     def test_initial_start_does_not_count_as_restart(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -812,7 +803,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertEqual(status["game_state"], "Waiting")
             self.assertEqual(status["detail"], "Waiting for game state")
 
-    def test_get_status_while_restart_backoff_pending_reports_waiting(self):
+    def test_get_status_while_restart_backoff_pending_stays_disconnected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             snapshot_path = Path(tmpdir) / "live-snapshot.json"
             source = make_state_source(snapshot_path)
@@ -821,14 +812,12 @@ class TetrioStateSourceTests(unittest.TestCase):
             source.last_ready = False
             source._pending_restart_record = True
             source.next_restart_allowed_at = time.time() + 1
-            source._ensure_running = TetrioStateSource._ensure_running.__get__(source, TetrioStateSource)
-            source.start = TetrioStateSource.start.__get__(source, TetrioStateSource)
 
             status = source.get_status()
 
-            self.assertEqual(status["browser_status"], "Reconnecting")
+            self.assertEqual(status["browser_status"], "Disconnected")
             self.assertEqual(status["game_state"], "Waiting")
-            self.assertIn("재시작 대기", status["detail"])
+            self.assertNotIn("재시작 대기", status["detail"])
 
 
 if __name__ == "__main__":

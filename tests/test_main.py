@@ -1,5 +1,6 @@
 import tkinter as tk
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import main
@@ -7,28 +8,58 @@ import main
 
 class FakeStateSource:
     def __init__(self, _config_path):
-        self.started = False
-
-    def get_status(self):
-        return {
-            "browser_status": "Connected",
-            "game_state": "Playing",
-            "piece_counter": 4,
-            "current": "T",
-            "hold": "I",
-            "queue": "LSZOJ",
-            "last_update_age_ms": 25,
-            "detail": "ready",
+        self.started = 0
+        self.closed = 0
+        self.running = False
+        self.wait_calls = 0
+        self.latest_result_calls = []
+        self.latest_result = None
+        self.status = {
+            "browser_status": "Disconnected",
+            "game_state": "Waiting",
+            "piece_counter": None,
+            "current": "-",
+            "hold": "-",
+            "queue": "-",
+            "last_update_age_ms": None,
+            "detail": "브라우저 열기를 눌러주세요",
         }
 
+    def get_status(self, allow_start=False):
+        self.last_allow_start = allow_start
+        return dict(self.status)
+
+    def get_latest_result(self, allow_start=False):
+        self.latest_result_calls.append(allow_start)
+        return self.latest_result
+
     def start(self):
-        self.started = True
+        self.started += 1
+        self.running = True
+
+    def is_running(self):
+        return self.running
+
+    def wait_until_connected(self, timeout_sec=10):
+        self.wait_calls += 1
+        return True
 
     def close(self):
+        self.closed += 1
+        self.running = False
         return None
 
     def reload_config(self):
         return None
+
+
+def make_config():
+    return {
+        "tetrio_cdp": {
+            "port": 9222,
+            "url": "https://tetr.io/",
+        }
+    }
 
 
 def make_result(current="T", active_guess="Z", hold="I", queue=None):
@@ -62,13 +93,60 @@ class FakeThread:
         self.started = True
 
 
+class MainHelperTests(unittest.TestCase):
+    def test_resolve_browser_executable_prefers_bundled_then_config_then_chrome_then_edge(self):
+        config = {"tetrio_cdp": {"browser_path": r"D:\custom\browser.exe"}}
+        bundled = str(main.get_resource_path("runtime", "chromium", "chrome.exe"))
+
+        resolved = main.resolve_browser_executable(
+            config=config,
+            env={"LOCALAPPDATA": r"C:\Users\MSI\AppData\Local"},
+            exists_fn=lambda candidate: str(candidate) == bundled,
+        )
+
+        self.assertEqual(resolved["executable"], bundled)
+        self.assertEqual(resolved["attempted_paths"], [bundled])
+
+    def test_build_browser_launch_command_uses_cdp_port_profile_and_url(self):
+        config = make_config()
+        profile_dir = Path(r"C:\Users\MSI\AppData\Local\TetrioPcHelper\browser-profile")
+
+        command = main.build_browser_launch_command(
+            config,
+            browser_executable=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            profile_dir=profile_dir,
+        )
+
+        self.assertEqual(command[0], r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        self.assertIn("--remote-debugging-port=9222", command)
+        self.assertIn(f"--user-data-dir={profile_dir}", command)
+        self.assertIn("--no-first-run", command)
+        self.assertIn("--no-default-browser-check", command)
+        self.assertIn("--new-window", command)
+        self.assertEqual(command[-1], "https://tetr.io/")
+
+    def test_build_browser_launch_command_raises_clear_error_when_browser_missing(self):
+        with mock.patch.object(main, "resolve_browser_executable", return_value={"executable": None, "attempted_paths": []}):
+            with self.assertRaisesRegex(RuntimeError, "사용 가능한 Chrome 또는 Edge 브라우저를 찾지 못했습니다."):
+                main.build_browser_launch_command(make_config())
+
+    def test_wait_for_cdp_endpoint_polls_until_ready(self):
+        calls = []
+
+        def probe(_port):
+            calls.append(True)
+            return len(calls) >= 3
+
+        self.assertTrue(main.wait_for_cdp_endpoint(9222, timeout_sec=1.0, poll_interval_sec=0.01, probe_fn=probe))
+        self.assertEqual(len(calls), 3)
+
+
 class MainUiTests(unittest.TestCase):
     def setUp(self):
         self.patchers = [
-            mock.patch.object(main, "load_config", return_value={}),
+            mock.patch.object(main, "load_config", return_value=make_config()),
             mock.patch.object(main, "TetrioStateSource", FakeStateSource),
             mock.patch.object(main.TetrisScannerApp, "register_global_hotkeys", autospec=True, return_value=None),
-            mock.patch.object(main.TetrisScannerApp, "start_browser_source", autospec=True, return_value=None),
             mock.patch.object(main.TetrisScannerApp, "start_pc_solver_warmup", autospec=True, return_value=None),
         ]
         for patcher in self.patchers:
@@ -96,16 +174,18 @@ class MainUiTests(unittest.TestCase):
                 texts.append(self.app.output.itemcget(item_id, "text"))
         return texts
 
-    def test_hydra_controls_are_removed_and_action_buttons_remain(self):
-        self.assertFalse(hasattr(self.app, "hydra_frame"))
-        self.assertFalse(hasattr(self.app, "active_var"))
-        self.assertFalse(hasattr(self.app, "manual_see_var"))
-        self.assertFalse(hasattr(self.app, "bag_var"))
-        self.assertFalse(hasattr(self.app, "mode_var"))
-        self.assertFalse(hasattr(self.app, "identity_var"))
-        self.assertFalse(hasattr(self.app, "board_size_var"))
-        self.assertEqual(self.app.pc_scan_button.cget("text"), "상태 읽기 ->\nPC 해법 찾기\n[Del]")
-        self.assertEqual(self.app.setup_scan_button.cget("text"), "상태 읽기 ->\n최적 셋업 찾기\n[End]")
+    def test_app_start_does_not_auto_start_browser_or_helper(self):
+        self.assertEqual(self.app.state_source.started, 0)
+        self.assertFalse(self.app.browser_launch_in_progress)
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 눌러주세요")
+        self.assertEqual(self.app.detail_var.get(), "Detail: 브라우저 열기를 눌러주세요")
+
+    def test_top_row_contains_only_three_centered_action_buttons(self):
+        children = self.app.button_frame.winfo_children()
+        texts = [child.cget("text") for child in children]
+        self.assertEqual(texts, ["PC 해법 찾기", "최적 셋업 찾기", "브라우저 열기"])
+        self.assertFalse(hasattr(self.app, "reload_button"))
+        self.assertFalse(hasattr(self.app, "connect_button"))
 
     def test_browser_state_panel_is_slimmed_down(self):
         self.assertEqual(len(self.app.state_frame.winfo_children()), 6)
@@ -129,6 +209,107 @@ class MainUiTests(unittest.TestCase):
         self.assertGreaterEqual(actual_height, 870)
         self.assertLessEqual(actual_height, 900)
         self.assertGreaterEqual(actual_height, self.root.winfo_reqheight())
+
+    def test_pc_button_keeps_existing_solver_callback(self):
+        with (
+            mock.patch.object(self.app, "ensure_browser_source_for_action", return_value=True) as ensure_mock,
+            mock.patch.object(self.app, "scan") as scan_mock,
+        ):
+            self.app.scan_for_pc_solve(show_popup=False)
+
+        ensure_mock.assert_called_once_with(show_popup=False)
+        scan_mock.assert_called_once_with(scan_target="pc_solve", show_popup=False)
+
+    def test_setup_button_keeps_existing_setup_callback(self):
+        with (
+            mock.patch.object(self.app, "ensure_browser_source_for_action", return_value=True) as ensure_mock,
+            mock.patch.object(self.app, "scan") as scan_mock,
+        ):
+            self.app.scan_for_setup_finder(show_popup=False)
+
+        ensure_mock.assert_called_once_with(show_popup=False)
+        scan_mock.assert_called_once_with(scan_target="setup", show_popup=False)
+
+    def test_pc_button_without_browser_only_shows_prompt(self):
+        with (
+            mock.patch.object(main, "is_cdp_endpoint_available", return_value=False),
+            mock.patch.object(self.app, "scan") as scan_mock,
+        ):
+            self.app.scan_for_pc_solve(show_popup=False)
+
+        scan_mock.assert_not_called()
+        self.assertEqual(self.app.state_source.started, 0)
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 먼저 눌러주세요.")
+
+    def test_setup_button_without_browser_only_shows_prompt(self):
+        with (
+            mock.patch.object(main, "is_cdp_endpoint_available", return_value=False),
+            mock.patch.object(self.app, "scan") as scan_mock,
+        ):
+            self.app.scan_for_setup_finder(show_popup=False)
+
+        scan_mock.assert_not_called()
+        self.assertEqual(self.app.state_source.started, 0)
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 먼저 눌러주세요.")
+
+    def test_action_buttons_lazy_connect_when_cdp_is_open(self):
+        with mock.patch.object(main, "is_cdp_endpoint_available", return_value=True):
+            connected = self.app.ensure_browser_source_for_action(show_popup=False)
+
+        self.assertTrue(connected)
+        self.assertEqual(self.app.state_source.started, 1)
+
+    def test_open_browser_worker_uses_existing_cdp_without_relaunch(self):
+        self.app._post_to_ui = lambda callback, *args: callback(*args)
+
+        with (
+            mock.patch.object(main, "is_cdp_endpoint_available", return_value=True),
+            mock.patch("subprocess.Popen") as popen_mock,
+        ):
+            self.app._open_tetrio_browser_worker()
+
+        popen_mock.assert_not_called()
+        self.assertEqual(self.app.state_source.started, 1)
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 연결됨")
+
+    def test_open_browser_worker_does_not_duplicate_reader_when_already_running(self):
+        self.app._post_to_ui = lambda callback, *args: callback(*args)
+        self.app.state_source.running = True
+
+        with (
+            mock.patch.object(main, "is_cdp_endpoint_available", return_value=True),
+            mock.patch("subprocess.Popen") as popen_mock,
+        ):
+            self.app._open_tetrio_browser_worker()
+
+        popen_mock.assert_not_called()
+        self.assertEqual(self.app.state_source.started, 0)
+
+    def test_browser_open_button_spawns_single_worker_while_in_progress(self):
+        fake_thread = FakeThread()
+
+        with mock.patch.object(main.threading, "Thread", return_value=fake_thread) as thread_mock:
+            self.app.open_tetrio_browser()
+            self.app.open_tetrio_browser()
+
+        self.assertEqual(thread_mock.call_count, 1)
+        self.assertTrue(fake_thread.started)
+        self.assertEqual(self.app.browser_open_button.cget("state"), "disabled")
+
+    def test_browser_open_failure_surfaces_gui_error(self):
+        with mock.patch.object(main.messagebox, "showerror") as error_mock:
+            self.app._on_browser_open_error("사용 가능한 Chrome 또는 Edge 브라우저를 찾지 못했습니다.")
+
+        error_mock.assert_called_once()
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 연결 실패")
+        self.assertIn("Chrome 또는 Edge", self.app.detail_var.get())
+
+    def test_refresh_browser_status_marks_existing_cdp_as_open(self):
+        with mock.patch.object(main, "is_cdp_endpoint_available", return_value=True):
+            self.app.refresh_browser_status()
+
+        self.assertEqual(self.app.browser_status_var.get(), "Browser: Open")
+        self.assertIn("브라우저가 열려 있습니다", self.app.detail_var.get())
 
     def test_run_pc_solver_uses_snapshot_current_hold_and_queue(self):
         fake_thread = FakeThread()

@@ -1,6 +1,12 @@
 import ctypes
+import os
+from pathlib import Path
+import subprocess
 import threading
+import time
 import traceback
+import urllib.error
+import urllib.request
 from itertools import combinations
 import tkinter as tk
 from tkinter import messagebox
@@ -23,7 +29,7 @@ from gomen_helper import (
     run_gomen_solver,
     warm_gomen_session,
 )
-from app_paths import ensure_runtime_file
+from app_paths import ensure_runtime_file, get_resource_path, get_user_data_path
 from tetrio_state_source import (
     TETROMINO_BASE_COORDS,
     TetrioStateSource,
@@ -33,6 +39,9 @@ from tetrio_state_source import (
 
 VK_DELETE = 0x2E
 VK_END = 0x23
+BROWSER_READY_TIMEOUT_SEC = 10.0
+BROWSER_READY_POLL_INTERVAL_SEC = 0.25
+BROWSER_LAUNCH_ENV_KEYS = ("TETRIO_BROWSER_PATH", "BROWSER_PATH", "CHROME_PATH")
 
 
 user32 = ctypes.windll.user32
@@ -66,6 +75,126 @@ DEFAULT_PIECE_COLORS = {
 }
 
 
+def get_tetrio_cdp_config(config):
+    if isinstance(config, dict):
+        return config.get("tetrio_cdp", {}) or {}
+    return {}
+
+
+def get_cdp_port(config):
+    raw_value = get_tetrio_cdp_config(config).get("port", 9222)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return 9222
+
+
+def get_tetrio_url(config):
+    return str(get_tetrio_cdp_config(config).get("url") or "https://tetr.io/").strip() or "https://tetr.io/"
+
+
+def get_browser_profile_path(config):
+    raw_value = str(get_tetrio_cdp_config(config).get("browser_profile_dir") or "").strip()
+    if raw_value:
+        path = Path(raw_value)
+        if path.is_absolute():
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        return get_user_data_path(*path.parts)
+    return get_user_data_path("browser-profile")
+
+
+def iter_browser_candidate_paths(config=None, env=None):
+    env = env or os.environ
+    yield str(get_resource_path("runtime", "chromium", "chrome.exe"))
+
+    config_browser = str(get_tetrio_cdp_config(config).get("browser_path") or "").strip()
+    if config_browser:
+        yield config_browser
+
+    for env_key in BROWSER_LAUNCH_ENV_KEYS:
+        env_browser = str(env.get(env_key) or "").strip()
+        if env_browser:
+            yield env_browser
+
+    local_appdata = str(env.get("LOCALAPPDATA") or "").strip()
+    chrome_candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    if local_appdata:
+        chrome_candidates.append(
+            str(Path(local_appdata) / "Google" / "Chrome" / "Application" / "chrome.exe")
+        )
+    for candidate in chrome_candidates:
+        yield candidate
+
+    for candidate in (
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ):
+        yield candidate
+
+
+def resolve_browser_executable(config=None, env=None, exists_fn=os.path.exists):
+    attempted_paths = []
+    seen_paths = set()
+    for candidate in iter_browser_candidate_paths(config=config, env=env):
+        normalized = os.path.normcase(os.path.normpath(str(candidate)))
+        if not candidate or normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        attempted_paths.append(str(candidate))
+        if exists_fn(candidate):
+            return {
+                "executable": str(candidate),
+                "attempted_paths": attempted_paths,
+            }
+    return {
+        "executable": None,
+        "attempted_paths": attempted_paths,
+    }
+
+
+def build_browser_launch_args(config, profile_dir=None):
+    profile_path = Path(profile_dir) if profile_dir is not None else get_browser_profile_path(config)
+    return [
+        f"--remote-debugging-port={get_cdp_port(config)}",
+        f"--user-data-dir={profile_path}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        get_tetrio_url(config),
+    ]
+
+
+def build_browser_launch_command(config, browser_executable=None, profile_dir=None):
+    resolved = browser_executable or resolve_browser_executable(config).get("executable")
+    if not resolved:
+        raise RuntimeError("사용 가능한 Chrome 또는 Edge 브라우저를 찾지 못했습니다.")
+    return [resolved, *build_browser_launch_args(config, profile_dir=profile_dir)]
+
+
+def is_cdp_endpoint_available(port, *, timeout_sec=0.5, urlopen_impl=urllib.request.urlopen):
+    request = urllib.request.Request(f"http://127.0.0.1:{int(port)}/json/version")
+    try:
+        with urlopen_impl(request, timeout=timeout_sec) as response:
+            status_code = getattr(response, "status", 200)
+            return int(status_code) == 200
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
+def wait_for_cdp_endpoint(port, *, timeout_sec=BROWSER_READY_TIMEOUT_SEC, poll_interval_sec=BROWSER_READY_POLL_INTERVAL_SEC, probe_fn=None):
+    probe = probe_fn or is_cdp_endpoint_available
+    deadline = time.time() + max(0.1, float(timeout_sec))
+    while time.time() < deadline:
+        if probe(port):
+            return True
+        time.sleep(max(0.05, float(poll_interval_sec)))
+    return False
+
+
 class TetrisScannerApp:
     def __init__(self, root):
         self.root = root
@@ -90,6 +219,7 @@ class TetrisScannerApp:
         self.is_closing = False
         self.is_pc_solver_warming = False
         self.pc_solver_warm_ready = False
+        self.browser_launch_in_progress = False
         self.hotkey_pressed = {
             VK_DELETE: False,
             VK_END: False,
@@ -115,12 +245,14 @@ class TetrisScannerApp:
 
         self.button_frame = tk.Frame(root)
         self.button_frame.pack(pady=8)
+        for column in range(3):
+            self.button_frame.grid_columnconfigure(column, weight=1)
 
         self.pc_scan_button = tk.Button(
             self.button_frame,
-            text="상태 읽기 ->\nPC 해법 찾기\n[Del]",
-            width=16,
-            height=3,
+            text="PC 해법 찾기",
+            width=15,
+            height=2,
             font=("Malgun Gothic", 11, "bold"),
             command=self.scan_for_pc_solve,
         )
@@ -128,33 +260,23 @@ class TetrisScannerApp:
 
         self.setup_scan_button = tk.Button(
             self.button_frame,
-            text="상태 읽기 ->\n최적 셋업 찾기\n[End]",
-            width=16,
-            height=3,
+            text="최적 셋업 찾기",
+            width=15,
+            height=2,
             font=("Malgun Gothic", 11, "bold"),
             command=self.scan_for_setup_finder,
         )
         self.setup_scan_button.grid(row=0, column=1, padx=5)
 
-        self.reload_button = tk.Button(
+        self.browser_open_button = tk.Button(
             self.button_frame,
-            text="설정 다시읽기",
-            width=10,
+            text="브라우저 열기",
+            width=15,
             height=2,
-            font=("Malgun Gothic", 12),
-            command=self.reload_config,
+            font=("Malgun Gothic", 11, "bold"),
+            command=self.open_tetrio_browser,
         )
-        self.reload_button.grid(row=0, column=2, padx=5)
-
-        self.connect_button = tk.Button(
-            self.button_frame,
-            text="브라우저 연결",
-            width=10,
-            height=2,
-            font=("Malgun Gothic", 12),
-            command=self.connect_browser_source,
-        )
-        self.connect_button.grid(row=0, column=3, padx=5)
+        self.browser_open_button.grid(row=0, column=2, padx=5)
 
         self.topmost_check = tk.Checkbutton(
             root,
@@ -171,12 +293,12 @@ class TetrisScannerApp:
             anchor="w",
         )
         self.pc_round_label.pack(fill="x", padx=16, pady=(0, 4))
-        self.browser_status_var = tk.StringVar(value="Browser: Connecting")
+        self.browser_status_var = tk.StringVar(value="Browser: Disconnected")
         self.game_state_var = tk.StringVar(value="Game state: Waiting")
         self.counter_var = tk.StringVar(value="Piece counter: -")
         self.queue_status_var = tk.StringVar(value="Current/Hold/Queue: -")
         self.age_var = tk.StringVar(value="Last update age: -")
-        self.detail_var = tk.StringVar(value="Detail: Waiting for game state")
+        self.detail_var = tk.StringVar(value="Detail: 브라우저 열기를 눌러주세요")
         self.pc_solver_status_var = tk.StringVar(value="PC SOLVER: 대기 중")
         self.build_state_status_panel()
         self.pc_solver_status_label = tk.Label(
@@ -263,7 +385,7 @@ class TetrisScannerApp:
 
         self.status_label = tk.Label(
             root,
-            text="브라우저 게임 상태 대기 중",
+            text="브라우저 열기를 눌러주세요",
             font=("Malgun Gothic", 10),
             anchor="w",
         )
@@ -277,7 +399,7 @@ class TetrisScannerApp:
         self.bind_keyboard_shortcuts()
         self.register_global_hotkeys()
         self.root.after(250, self.start_pc_solver_warmup)
-        self.root.after(200, self.start_browser_source)
+        self.root.after(200, self.refresh_browser_status)
         self.last_pc_signature = None
         self.root.update_idletasks()
         required_height = self.root.winfo_reqheight()
@@ -645,13 +767,19 @@ class TetrisScannerApp:
         self.setup_scan_button.config(state=state)
 
     def update_action_buttons_state(self):
-        state = "disabled" if self.is_scanning or self.is_pc_solving else "normal"
-        self.set_scan_buttons_state(state)
+        scan_state = "disabled" if self.is_scanning or self.is_pc_solving or self.browser_launch_in_progress else "normal"
+        browser_state = "disabled" if self.browser_launch_in_progress or self.is_closing else "normal"
+        self.set_scan_buttons_state(scan_state)
+        self.browser_open_button.config(state=browser_state)
 
     def scan_for_pc_solve(self, show_popup=True):
+        if not self.ensure_browser_source_for_action(show_popup=show_popup):
+            return
         self.scan(scan_target="pc_solve", show_popup=show_popup)
 
     def scan_for_setup_finder(self, show_popup=True):
+        if not self.ensure_browser_source_for_action(show_popup=show_popup):
+            return
         self.scan(scan_target="setup", show_popup=show_popup)
 
     def schedule_auto_scan(self, delay_ms=None):
@@ -693,21 +821,110 @@ class TetrisScannerApp:
         except Exception as exc:
             messagebox.showerror("설정 오류", str(exc))
 
-    def connect_browser_source(self):
+    def _set_browser_detail(self, message):
+        self.detail_var.set(f"Detail: {message}")
+
+    def _get_browser_launch_popen_kwargs(self):
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                subprocess,
+                "CREATE_NEW_PROCESS_GROUP",
+                0,
+            )
+        return {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            "creationflags": creationflags,
+        }
+
+    def _ensure_browser_reader_started(self):
+        if self.state_source.is_running():
+            return
+        self.state_source.start()
+
+    def ensure_browser_source_for_action(self, show_popup=True):
+        port = get_cdp_port(self.config)
+        if not is_cdp_endpoint_available(port):
+            message = "브라우저 열기를 먼저 눌러주세요."
+            self.status_label.config(text=message)
+            self._set_browser_detail(message)
+            return False
+
         try:
-            self.state_source.start()
-            self.status_label.config(text="브라우저 연결 시도 중...")
+            self._ensure_browser_reader_started()
         except Exception as exc:
             self.status_label.config(text="브라우저 연결 실패")
-            messagebox.showerror("브라우저 연결 오류", str(exc))
+            self._set_browser_detail(str(exc))
+            if show_popup:
+                messagebox.showerror("브라우저 연결 오류", str(exc))
+            return False
+        return True
 
-    def start_browser_source(self):
+    def open_tetrio_browser(self):
         if self.is_closing:
             return
+        if self.browser_launch_in_progress:
+            self.status_label.config(text="브라우저 준비 중...")
+            return
+        self.browser_launch_in_progress = True
+        self.update_action_buttons_state()
+        self.status_label.config(text="브라우저 준비 중...")
+        self._set_browser_detail("브라우저 준비 중...")
+        worker = threading.Thread(target=self._open_tetrio_browser_worker, daemon=True)
+        worker.start()
+
+    def _open_tetrio_browser_worker(self):
+        port = get_cdp_port(self.config)
         try:
-            self.state_source.start()
+            already_open = is_cdp_endpoint_available(port)
+            if not already_open:
+                resolved = resolve_browser_executable(self.config)
+                executable = resolved.get("executable")
+                if not executable:
+                    raise RuntimeError("사용 가능한 Chrome 또는 Edge 브라우저를 찾지 못했습니다.")
+                command = build_browser_launch_command(
+                    self.config,
+                    browser_executable=executable,
+                    profile_dir=get_browser_profile_path(self.config),
+                )
+                try:
+                    subprocess.Popen(command, **self._get_browser_launch_popen_kwargs())
+                except Exception as exc:
+                    attempted_text = " | ".join(resolved.get("attempted_paths") or [executable])
+                    raise RuntimeError(
+                        f"브라우저 실행 실패\n"
+                        f"시도 경로: {attempted_text}\n"
+                        f"spawn error: {exc}"
+                    ) from exc
+                if not wait_for_cdp_endpoint(port):
+                    raise RuntimeError(f"CDP 준비 확인 실패: http://127.0.0.1:{port}/json/version")
+
+            self._ensure_browser_reader_started()
+            self.state_source.wait_until_connected(timeout_sec=BROWSER_READY_TIMEOUT_SEC)
+            self._post_to_ui(self._on_browser_open_success)
         except Exception as exc:
-            self.status_label.config(text=f"브라우저 연결 대기: {exc}")
+            self._post_to_ui(self._on_browser_open_error, str(exc))
+        finally:
+            self._post_to_ui(self._on_browser_open_finished)
+
+    def _on_browser_open_success(self):
+        self.status_label.config(text="브라우저 연결됨")
+        self._set_browser_detail("브라우저 연결됨")
+
+    def _on_browser_open_error(self, error_text):
+        self.status_label.config(text="브라우저 연결 실패")
+        self._set_browser_detail(error_text)
+        messagebox.showerror("브라우저 연결 오류", error_text)
+
+    def _on_browser_open_finished(self):
+        self.browser_launch_in_progress = False
+        self.update_action_buttons_state()
+        if self.state_status_job is not None:
+            self.root.after_cancel(self.state_status_job)
+            self.state_status_job = None
         self.refresh_browser_status()
 
     def refresh_browser_status(self):
@@ -716,7 +933,7 @@ class TetrisScannerApp:
             return
 
         try:
-            status = self.state_source.get_status()
+            status = self.state_source.get_status(allow_start=False)
         except Exception as exc:
             status = {
                 "browser_status": "Error",
@@ -728,18 +945,29 @@ class TetrisScannerApp:
                 "last_update_age_ms": None,
                 "detail": str(exc),
             }
+        port = get_cdp_port(self.config)
+        cdp_open = is_cdp_endpoint_available(port)
         age_ms = status.get("last_update_age_ms")
         age_text = "-" if age_ms is None else f"{age_ms}ms"
         queue_text = status.get("queue") or "-"
+        browser_status = status.get("browser_status", "Unknown")
+        detail_text = status.get("detail", "-")
 
-        self.browser_status_var.set(f"Browser: {status.get('browser_status', 'Unknown')}")
+        if browser_status == "Disconnected":
+            if cdp_open:
+                browser_status = "Open"
+                detail_text = "브라우저가 열려 있습니다. 브라우저 열기를 눌러 연결하세요."
+            elif "브라우저 연결 끊김" not in detail_text and "exit code" not in detail_text:
+                detail_text = "브라우저 열기를 눌러주세요"
+
+        self.browser_status_var.set(f"Browser: {browser_status}")
         self.game_state_var.set(f"Game state: {status.get('game_state', 'Unknown')}")
         self.counter_var.set(f"Piece counter: {status.get('piece_counter', '-')}")
         self.queue_status_var.set(
             f"Current/Hold/Queue: {status.get('current', '-')} / {status.get('hold', '-')} / {queue_text}"
         )
         self.age_var.set(f"Last update age: {age_text}")
-        self.detail_var.set(f"Detail: {status.get('detail', '-')}")
+        self.detail_var.set(f"Detail: {detail_text}")
 
         self.state_status_job = self.root.after(500, self.refresh_browser_status)
 
@@ -1881,9 +2109,10 @@ class TetrisScannerApp:
     def _scan_worker(self, scan_target, show_popup):
         try:
             print("[STATE] read start")
-            result = self.state_source.get_latest_result()
+            self.state_source.wait_until_connected(timeout_sec=5.0)
+            result = self.state_source.get_latest_result(allow_start=False)
             if result is None:
-                detail = self.state_source.get_status().get("detail") or "Waiting for game state"
+                detail = self.state_source.get_status(allow_start=False).get("detail") or "Waiting for game state"
                 raise RuntimeError(detail)
 
             self._log_state_result(result)

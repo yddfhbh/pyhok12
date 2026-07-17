@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 
-APP_DIR_NAME = "TetrisScan"
+APP_DIR_NAME = "TetrioPcHelper"
 
 
 def get_bundle_base_dir():
@@ -34,11 +34,7 @@ def is_directory_writable(path):
         return False
 
 
-def get_runtime_data_dir():
-    launch_dir = get_launch_base_dir()
-    if is_directory_writable(launch_dir):
-        return launch_dir
-
+def get_user_data_dir():
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
         fallback = Path(local_appdata) / APP_DIR_NAME
@@ -49,13 +45,24 @@ def get_runtime_data_dir():
     return fallback
 
 
+def get_runtime_data_dir():
+    return get_user_data_dir()
+
+
 def get_resource_path(*parts):
     return get_bundle_base_dir().joinpath(*parts)
 
 
+def get_user_data_path(*parts):
+    path = get_user_data_dir().joinpath(*parts)
+    parent = path if not path.suffix else path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def ensure_runtime_file(relative_path):
     relative = Path(relative_path)
-    target = get_runtime_data_dir() / relative
+    target = get_user_data_path(*relative.parts)
     if target.exists():
         return target
 
@@ -73,8 +80,16 @@ def resolve_runtime_file(relative_path):
     if relative.is_absolute():
         return relative
 
-    launch_candidate = get_launch_base_dir() / relative
-    if launch_candidate.exists():
-        return launch_candidate
-
     return ensure_runtime_file(relative)
+
+
+def resolve_node_executable():
+    bundled = get_resource_path("runtime", "node.exe")
+    if bundled.exists():
+        return str(bundled)
+
+    path_node = shutil.which("node.exe") or shutil.which("node")
+    if path_node:
+        return path_node
+
+    raise FileNotFoundError("Node.js 실행 파일을 찾을 수 없습니다.")

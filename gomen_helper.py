@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 
-from app_paths import get_resource_path
+from app_paths import get_resource_path, resolve_node_executable
 
 
 VALID_PIECES = set("IJLOSTZ")
@@ -308,10 +308,7 @@ def get_tools_dir():
 
 
 def get_node_executable():
-    bundled = get_resource_path("tools", "node.exe")
-    if bundled.exists():
-        return str(bundled)
-    return "node"
+    return resolve_node_executable()
 
 
 def get_gomen_solver_path():

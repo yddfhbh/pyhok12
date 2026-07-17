@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_paths import get_resource_path, get_runtime_data_dir, resolve_runtime_file
+from app_paths import get_resource_path, get_runtime_data_dir, resolve_node_executable, resolve_runtime_file
 
 
 VALID_PIECES = set("IJLOSTZ")
@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
         "vs_object_snapshot_path": "runtime/tetrio-vs-object-snapshot.json",
         "vs_bridge_path": "runtime/vs-ws-bridge.json",
         "stale_after_ms": 1000,
-        "auto_launch_chromium": True,
+        "auto_launch_chromium": False,
         "poll_ms": 20,
         "probe_page_state": True,
         "use_ribbon_websocket": True,
@@ -444,7 +444,6 @@ class TetrioStateSource:
         with self.lock:
             self.config = load_config(self.config_path)
             self.close(restart=False)
-            self.start()
 
     def _is_process_running(self):
         proc = self.proc
@@ -526,6 +525,10 @@ class TetrioStateSource:
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
 
+    def is_running(self):
+        with self.lock:
+            return self._is_process_running()
+
     def close(self, restart=False):
         with self.lock:
             proc = self.proc
@@ -549,11 +552,26 @@ class TetrioStateSource:
         if not restart:
             self.browser_connected = False
             self.last_ready = False
+            if self.last_reason == "Browser connected":
+                self.last_reason = "브라우저 연결 끊김"
         self.last_valid_snapshot = None
         self._reset_sequence_guard()
 
-    def get_latest_result(self):
-        snapshot = self.get_latest_valid_snapshot()
+    def wait_until_connected(self, timeout_sec=10.0):
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        while time.time() < deadline:
+            with self.lock:
+                if self.browser_connected and self.last_ready and self._is_process_running():
+                    return True
+                if self.proc is not None and self.proc.poll() is not None:
+                    break
+            time.sleep(0.05)
+        with self.lock:
+            detail = self.last_error or self.last_reason or "브라우저 연결 대기 중"
+        raise RuntimeError(detail)
+
+    def get_latest_result(self, allow_start=False):
+        snapshot = self.get_latest_valid_snapshot(allow_start=allow_start)
         if snapshot is None:
             return None
         progress_details = resolve_effective_piece_progress_details(snapshot)
@@ -577,12 +595,16 @@ class TetrioStateSource:
             "snapshot": snapshot,
         }
 
-    def get_latest_valid_snapshot(self):
+    def get_latest_valid_snapshot(self, allow_start=False):
         with self.lock:
-            try:
-                self._ensure_running()
-            except Exception as exc:
-                self._remember_error(str(exc))
+            if allow_start:
+                try:
+                    self._ensure_running()
+                except Exception as exc:
+                    self._remember_error(str(exc))
+                    self.last_valid_snapshot = None
+                    return None
+            elif not self._is_process_running():
                 self.last_valid_snapshot = None
                 return None
             payload = self._read_snapshot_payload()
@@ -668,19 +690,19 @@ class TetrioStateSource:
             self._mark_helper_success("Ready")
             return snapshot
 
-    def get_status(self):
+    def get_status(self, allow_start=False):
         try:
-            snapshot = self.get_latest_valid_snapshot()
+            snapshot = self.get_latest_valid_snapshot(allow_start=allow_start)
         except Exception as exc:
             self._remember_error(f"상태 갱신 실패: {exc}")
             snapshot = None
         helper_running = self._is_process_running()
         browser_status = "Connected" if self.browser_connected else "Disconnected"
         game_state = "Ready"
-        detail = self.last_reason
+        detail = self.last_reason or "브라우저 열기를 눌러주세요"
 
         if not helper_running:
-            browser_status = "Reconnecting"
+            browser_status = "Disconnected"
             game_state = "Waiting"
             if self.last_error:
                 detail = self.last_error
@@ -732,8 +754,7 @@ class TetrioStateSource:
             "--poll-ms",
             str(cdp_config["poll_ms"]),
         ]
-        if not cdp_config.get("auto_launch_chromium", True):
-            command.extend(["--connect-only", "1"])
+        command.extend(["--connect-only", "1"])
         if not cdp_config.get("probe_page_state", True):
             command.extend(["--probe-page-state", "0"])
         if not cdp_config.get("use_ribbon_websocket", True):
@@ -816,10 +837,10 @@ class TetrioStateSource:
                         self.last_ready = False
                         self.last_valid_snapshot = None
                         self._reset_sequence_guard()
+                        self.last_reason = "브라우저 연결 끊김"
 
                 if not intentional_close:
-                    self._schedule_restart_after_exit()
-                    self._remember_error(f"CDP helper가 종료되었습니다. exit code={exit_code}")
+                    self._remember_error(f"브라우저 연결 끊김 (helper exit code={exit_code})")
 
     def _read_snapshot_payload(self):
         snapshot_path = self._resolve_runtime_path(self.config["tetrio_cdp"]["snapshot_path"])
@@ -855,7 +876,4 @@ class TetrioStateSource:
 
     @staticmethod
     def _get_node_executable():
-        bundled = get_resource_path("tools", "node.exe")
-        if bundled.exists():
-            return str(bundled)
-        return "node"
+        return resolve_node_executable()
