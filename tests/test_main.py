@@ -42,6 +42,11 @@ def make_result(current="T", active_guess="Z", hold="I", queue=None):
         "pc_round": 1,
         "piece_counter": 4,
         "piece_counter_source": "stats.piecesPlaced",
+        "lines_cleared": 0,
+        "derived_placed_pieces": None,
+        "fixed_cells": 0,
+        "piece_progress_source": "piece-counter",
+        "pc_failure_reason": None,
         "state_revision": 4,
     }
 
@@ -216,6 +221,67 @@ class MainUiTests(unittest.TestCase):
 
         render_mock.assert_called_once_with(variants)
         self.assertIn("최적 셋업", self.app.status_label.cget("text"))
+
+    def test_build_setup_variants_uses_current_on_empty_locked_board(self):
+        result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])
+        result["pieces_count"] = 0
+        result["piece_counter"] = None
+        result["piece_counter_source"] = "derived-revision"
+        result["piece_progress_source"] = "derived-spawn-counter"
+        result["state_revision"] = 0
+
+        with mock.patch.object(
+            main,
+            "find_setup_candidates_for_pc",
+            return_value=[{"ok": True, "queue": "ITLSOZ", "result": {"id": "setup-1", "fumen": "", "sol": "100%"}}],
+        ) as finder_mock:
+            variants = self.app.build_setup_variants(result)
+
+        self.assertEqual(finder_mock.call_args.args[1], 1)
+        self.assertEqual(len(variants), 1)
+
+    def test_should_show_setup_recommendation_accepts_current_separate_from_locked_board(self):
+        result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])
+        result["pieces_count"] = 0
+        result["piece_counter"] = None
+        result["piece_counter_source"] = "derived-revision"
+        result["piece_progress_source"] = "derived-spawn-counter"
+        result["state_revision"] = 0
+
+        self.assertTrue(self.app.should_show_setup_recommendation(result))
+
+    def test_build_setup_variants_logs_when_pc_round_is_unavailable(self):
+        result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])
+        result["pieces_count"] = None
+        result["pc_round"] = None
+        result["piece_counter"] = None
+        result["piece_counter_source"] = "derived-revision"
+        result["lines_cleared"] = None
+        result["fixed_cells"] = 0
+        result["pc_failure_reason"] = "pieceCounter/linesCleared 없음"
+        result["state_revision"] = 0
+
+        with mock.patch("builtins.print") as print_mock:
+            variants = self.app.build_setup_variants(result)
+
+        self.assertEqual(variants, [])
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("[SETUP] skipped reason=pc_round_unavailable", printed)
+        self.assertIn("pieces_count=None", printed)
+        self.assertIn("linesCleared=None", printed)
+        self.assertIn("fixedCells=0", printed)
+        self.assertIn("stateRevision=0", printed)
+
+    def test_format_pc_round_info_shows_failure_reason(self):
+        result = make_result()
+        result["pieces_count"] = None
+        result["pc_round"] = None
+        result["piece_counter"] = None
+        result["piece_counter_source"] = "derived-revision"
+        result["lines_cleared"] = None
+        result["pc_failure_reason"] = "진행값 불일치"
+
+        self.assertEqual(self.app.format_pc_round_info(result), "현재 PC 인식 실패: 진행값 불일치")
 
     def test_warmup_failure_sets_status_and_later_solve_can_start(self):
         fake_thread = FakeThread()

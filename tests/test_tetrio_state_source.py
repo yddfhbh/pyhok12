@@ -14,6 +14,7 @@ from tetrio_state_source import (
     count_fixed_board_cells,
     normalize_snapshot_payload,
     resolve_effective_piece_progress,
+    resolve_effective_piece_progress_details,
 )
 
 
@@ -40,6 +41,7 @@ def make_payload(**overrides):
         "pieceCounter": 15,
         "pieceCounterSource": "stats.piecesPlaced",
         "linesCleared": 0,
+        "derivedPlacedPieces": None,
         "stateRevision": 15,
         "gameId": "solo-1",
         "roundId": None,
@@ -304,6 +306,7 @@ class SnapshotNormalizationTests(unittest.TestCase):
         self.assertEqual(snapshot.lines_cleared, 0)
         self.assertEqual(snapshot.state_revision, 7)
         self.assertEqual(resolve_effective_piece_progress(snapshot), 0)
+        self.assertIsNone(snapshot.derived_placed_pieces)
 
 
 class TetrioStateSourceTests(unittest.TestCase):
@@ -642,10 +645,52 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result["piece_counter"], None)
             self.assertEqual(result["piece_counter_source"], "derived-revision")
+            self.assertEqual(result["lines_cleared"], 0)
             self.assertEqual(result["state_revision"], 4)
             self.assertEqual(count_fixed_board_cells(result["board"]), 28)
             self.assertEqual(result["pieces_count"], 7)
             self.assertEqual(result["pc_round"], 1)
+
+    def test_get_latest_result_uses_new_session_zero_piece_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source._ensure_running = lambda: None
+
+            write_snapshot(
+                snapshot_path,
+                make_payload(
+                    board=make_board(20),
+                    hold=None,
+                    pieceCounter=None,
+                    pieceCounterSource="derived-revision",
+                    linesCleared=None,
+                    derivedPlacedPieces=0,
+                    stateRevision=0,
+                    token="session-1:0",
+                ),
+            )
+            result = source.get_latest_result()
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["pieces_count"], 0)
+            self.assertEqual(result["pc_round"], 1)
+            self.assertEqual(result["piece_progress_source"], "derived-spawn-counter")
+
+    def test_empty_board_mid_session_does_not_force_zero_pieces(self):
+        snapshot = SimpleNamespace(
+            mode="Solo",
+            board=[["." for _ in range(10)] for _ in range(20)],
+            piece_counter=None,
+            piece_counter_source="derived-revision",
+            lines_cleared=None,
+            derived_placed_pieces=None,
+            state_revision=5,
+        )
+
+        details = resolve_effective_piece_progress_details(snapshot)
+        self.assertIsNone(details["pieces_count"])
+        self.assertEqual(details["failure_reason"], "pieceCounter/linesCleared 없음")
 
     def test_get_latest_result_prefers_real_piece_counter_over_state_revision(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -668,6 +713,33 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertEqual(result["pieces_count"], 11)
             self.assertEqual(result["pc_round"], 2)
 
+    def test_effective_piece_progress_uses_lines_zero_as_real_value(self):
+        snapshot = SimpleNamespace(
+            mode="Solo",
+            board=[["." for _ in range(10)] for _ in range(20)],
+            piece_counter=None,
+            piece_counter_source="derived-revision",
+            lines_cleared=0,
+            derived_placed_pieces=None,
+            state_revision=0,
+        )
+
+        self.assertEqual(resolve_effective_piece_progress(snapshot), 0)
+
+    def test_effective_piece_progress_uses_board_lines_formula_for_four_lines(self):
+        board = [["." for _ in range(10)] for _ in range(20)]
+        snapshot = SimpleNamespace(
+            mode="Solo",
+            board=board,
+            piece_counter=None,
+            piece_counter_source="derived-revision",
+            lines_cleared=4,
+            derived_placed_pieces=None,
+            state_revision=8,
+        )
+
+        self.assertEqual(resolve_effective_piece_progress(snapshot), 10)
+
     def test_effective_piece_progress_is_none_when_counter_and_lines_are_unavailable(self):
         snapshot = SimpleNamespace(
             mode="Solo",
@@ -675,6 +747,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             piece_counter=None,
             piece_counter_source="unknown-source",
             lines_cleared=None,
+            derived_placed_pieces=None,
             state_revision=None,
         )
 
@@ -692,6 +765,7 @@ class TetrioStateSourceTests(unittest.TestCase):
                     pieceCounter=None,
                     pieceCounterSource="derived-revision",
                     linesCleared=None,
+                    derivedPlacedPieces=None,
                     stateRevision=10,
                     token="session-1:10",
                 ),
@@ -701,6 +775,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertIsNone(result["pieces_count"])
             self.assertIsNone(result["pc_round"])
+            self.assertEqual(result["pc_failure_reason"], "pieceCounter/linesCleared 없음")
 
     def test_restart_backoff_caps_at_five_seconds(self):
         with tempfile.TemporaryDirectory() as tmpdir:

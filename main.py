@@ -800,6 +800,7 @@ class TetrisScannerApp:
 
     def get_pc_round_info(self, result):
         pieces_count = result.get("pieces_count")
+        failure_reason = result.get("pc_failure_reason") or "pieceCounter/linesCleared 없음"
 
         if pieces_count is not None:
             try:
@@ -821,6 +822,7 @@ class TetrisScannerApp:
                     "bag_in_cycle": bag_in_cycle,
                     "structure": structure,
                     "source": "pieces",
+                    "failure_reason": None,
                 }
             except (TypeError, ValueError):
                 pass
@@ -843,35 +845,10 @@ class TetrisScannerApp:
                     "bag_in_cycle": None,
                     "structure": structure,
                     "source": "pc_round",
+                    "failure_reason": None,
                 }
             except (TypeError, ValueError):
                 pass
-
-        # pieces OCR이 실패했더라도, 보드에 현재 active 미노만 잡힌 상태면
-        # 게임 시작 직후 0p = 1회차로 본다.
-        board = result.get("board") or []
-        active = result.get("active_guess") or ""
-
-        try:
-            if active and self.has_single_top_active_piece(board, active) and self.count_visible_cells(board) <= 4:
-                pieces = 0
-                cycle_pieces = 0
-                pc_round = 1
-                pc_progress = 0
-                bag_in_cycle = PC_BAG_TABLE[0][0]
-                structure = PC_STRUCTURES.get(1, "-")
-
-                return {
-                    "pieces_count": pieces,
-                    "cycle_pieces": cycle_pieces,
-                    "pc_round": pc_round,
-                    "pc_progress": pc_progress,
-                    "bag_in_cycle": bag_in_cycle,
-                    "structure": structure,
-                    "source": "active_only_fallback",
-                }
-        except Exception:
-            pass
 
         return {
             "pieces_count": None,
@@ -881,6 +858,7 @@ class TetrisScannerApp:
             "bag_in_cycle": None,
             "structure": "-",
             "source": "unknown",
+            "failure_reason": failure_reason,
         }
 
 
@@ -888,16 +866,7 @@ class TetrisScannerApp:
         info = self.get_pc_round_info(result)
 
         if info["pc_round"] is None:
-            return "현재 PC: 인식 실패"
-
-        if info["source"] == "active_only_fallback":
-            return (
-                f"현재 PC: {info['pc_round']}회차 | "
-                f"{info['pc_progress']}/10p | "
-                f"총 {info['pieces_count']}p | "
-                f"가방 {info['bag_in_cycle']} | "
-                f"구조 {info['structure']} | 추정"
-            )
+            return f"현재 PC 인식 실패: {info.get('failure_reason') or 'pieceCounter/linesCleared 없음'}"
 
         if info["pieces_count"] is None:
             return (
@@ -1224,8 +1193,8 @@ class TetrisScannerApp:
             return []
 
         board = result.get("board") or []
-        active = result.get("active_guess") or ""
-        hold = result.get("hold") or ""
+        active = (result.get("current") or result.get("active_guess") or "").strip().upper()
+        hold = (result.get("hold") or "").strip().upper()
         queue = [piece for piece in result.get("queue", []) if piece]
         queue_text_only = "".join(queue)
         round_info = self.get_pc_round_info(result)
@@ -1238,6 +1207,14 @@ class TetrisScannerApp:
             return []
 
         if round_from_counter not in (1, 2, 3, 4, 5, 6, 7):
+            print("[SETUP] skipped reason=pc_round_unavailable")
+            print(
+                "[SETUP]",
+                f"pieces_count={result.get('pieces_count')}",
+                f"linesCleared={result.get('lines_cleared')}",
+                f"fixedCells={result.get('fixed_cells')}",
+                f"stateRevision={result.get('state_revision')}",
+            )
             return []
 
         setup_options = self.get_setup_options_by_round()
@@ -1324,70 +1301,29 @@ class TetrisScannerApp:
         count = 0
         for row in board or []:
             for cell in row:
-                if cell in VISIBLE_FIELD_PIECES:
+                if cell != ".":
                     count += 1
         return count
 
 
     def should_show_setup_recommendation(self, result):
         board = result.get("board") or []
-        active = result.get("active_guess") or ""
-
-        # 상단 active 미노 하나가 제대로 잡힌 상황이 아니면 셋업 추천 X
-        if not self.has_single_top_active_piece(board, active):
+        current = (result.get("current") or result.get("active_guess") or "").strip().upper()
+        if not current:
             return False
 
-        # 현재 낙하 미노만 있으면 보통 4칸.
-        # 5칸 이상이면 이미 바닥에 놓인 블럭이 있다고 판단.
-        return self.count_visible_cells(board) <= 4    
+        round_info = self.get_pc_round_info(result)
+        fixed_cells = result.get("fixed_cells")
+        if fixed_cells is None:
+            fixed_cells = self.count_visible_cells(board)
 
-    def has_single_top_active_piece(self, board, active):
-        if not board or not active or active not in VISIBLE_FIELD_PIECES:
+        if fixed_cells > 4:
             return False
-
-        rows = len(board)
-        cols = len(board[0]) if rows else 0
-
-        # 아래 5칸은 제외하고, 그 위에 있는 active 덩어리를 현재 조작 미노로 봄
-        active_search_bottom = max(0, rows - 5)
-
-        cells = []
-        for row_index in range(active_search_bottom):
-            for col_index, piece in enumerate(board[row_index]):
-                if piece in VISIBLE_FIELD_PIECES:
-                    cells.append((row_index, col_index, piece))
-
-        if not cells:
+        if round_info["pc_round"] != 1:
             return False
-
-        # active 후보 영역에 여러 종류가 섞이면 셋업 추천은 하지 않음
-        active_cells = [(r, c) for r, c, piece in cells if piece == active]
-        other_cells = [(r, c, piece) for r, c, piece in cells if piece != active]
-
-        if other_cells:
+        if round_info["pc_progress"] is None:
             return False
-
-        if len(active_cells) > 4:
-            return False
-
-        remaining = set(active_cells)
-        stack = [next(iter(remaining))]
-        seen = set()
-
-        while stack:
-            cell = stack.pop()
-            if cell in seen:
-                continue
-
-            seen.add(cell)
-            r, c = cell
-
-            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nxt = (r + dr, c + dc)
-                if nxt in remaining and nxt not in seen:
-                    stack.append(nxt)
-
-        return len(seen) == len(remaining)
+        return round_info["pc_progress"] <= 1
 
     def rgb_to_hex(self, rgb):
         if not isinstance(rgb, (list, tuple)) or len(rgb) < 3:
@@ -1748,7 +1684,11 @@ class TetrisScannerApp:
             "[STATE RESULT]",
             "pieceCounter=", result.get("piece_counter"),
             "pieceCounterSource=", result.get("piece_counter_source"),
+            "linesCleared=", result.get("lines_cleared"),
+            "derivedPlacedPieces=", result.get("derived_placed_pieces"),
             "stateRevision=", result.get("state_revision"),
+            "fixedCells=", result.get("fixed_cells"),
+            "pieceProgressSource=", result.get("piece_progress_source"),
             "pieces_count=", result.get("pieces_count"),
             "pc_round=", result.get("pc_round"),
             "current=", result.get("current"),

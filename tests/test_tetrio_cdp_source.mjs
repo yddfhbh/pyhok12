@@ -7,14 +7,17 @@ import {
   buildSoloSpawnSignature,
   buildTombstoneSnapshot,
   captureTetrioGame,
+  countOccupiedFieldCells,
   createSessionState,
   exposeTetrioGameFromPausedCallFrames,
   markCurrentGameAsEnded,
   normalizeSoloPieceValue,
   pausedFrameExposureExpression,
   readTetrioState,
+  resolveSoloDerivedPlacedPieces,
   resetSessionState,
   resolveSoloStateRevision,
+  selectSoloLinesClearedCandidate,
   selectSoloPieceCounterCandidate,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
@@ -157,6 +160,21 @@ test("selectSoloPieceCounterCandidate keeps zero and derived revision fallback",
   });
 });
 
+test("selectSoloLinesClearedCandidate keeps zero and checks solo sources", () => {
+  assert.deepEqual(
+    selectSoloLinesClearedCandidate({
+      state: {
+        lines: 0
+      }
+    }),
+    {
+      value: 0,
+      source: "state.lines"
+    }
+  );
+  assert.equal(countOccupiedFieldCells([[true, false], [true, true]]), 3);
+});
+
 test("resolveSoloStateRevision does not increase on repeated polls but increments on spawn changes", () => {
   const sessionState = createSessionState();
   updateSessionState(sessionState, {
@@ -188,6 +206,144 @@ test("resolveSoloStateRevision does not increase on repeated polls but increment
   assert.equal(first, 0);
   assert.equal(second, 0);
   assert.equal(third, 1);
+});
+
+test("resolveSoloDerivedPlacedPieces sets zero only for first empty new-session snapshot", () => {
+  const sessionState = createSessionState();
+  updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  const state = {
+    field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+    current: "I",
+    hold: null,
+    queue: ["T", "L", "S", "O", "Z"],
+    pieceCounter: null,
+    pieceCounterSource: "derived-revision",
+    linesCleared: undefined
+  };
+
+  assert.equal(resolveSoloDerivedPlacedPieces(sessionState, state, { stateRevision: 0 }), 0);
+
+  const midSession = createSessionState();
+  updateSessionState(midSession, {
+    playing: true,
+    gameId: "solo-2",
+    gameObjectId: "object-2"
+  });
+  assert.equal(resolveSoloDerivedPlacedPieces(midSession, state, { stateRevision: 2 }), null);
+});
+
+test("resolveSoloDerivedPlacedPieces does not advance on hold-only changes", () => {
+  const sessionState = createSessionState();
+  updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  const firstState = {
+    field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+    current: "I",
+    hold: null,
+    queue: ["T", "L", "S", "O", "Z"],
+    pieceCounter: null,
+    pieceCounterSource: "derived-revision",
+    linesCleared: undefined
+  };
+  resolveSoloDerivedPlacedPieces(sessionState, firstState, { stateRevision: 0 });
+
+  const holdSwapState = {
+    ...firstState,
+    current: "O",
+    hold: "I"
+  };
+  assert.equal(resolveSoloDerivedPlacedPieces(sessionState, holdSwapState, { stateRevision: 1 }), 0);
+});
+
+test("resolveSoloDerivedPlacedPieces advances once on queue shift and does not double-count repeats", () => {
+  const sessionState = createSessionState();
+  updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  const emptyField = Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false));
+  resolveSoloDerivedPlacedPieces(
+    sessionState,
+    {
+      field: emptyField,
+      current: "I",
+      hold: null,
+      queue: ["T", "L", "S", "O", "Z"],
+      pieceCounter: null,
+      pieceCounterSource: "derived-revision",
+      linesCleared: undefined
+    },
+    { stateRevision: 0 }
+  );
+
+  const secondField = emptyField.map((row) => [...row]);
+  secondField[0][0] = true;
+  secondField[0][1] = true;
+  secondField[0][2] = true;
+  secondField[0][3] = true;
+  const advanced = {
+    field: secondField,
+    current: "T",
+    hold: null,
+    queue: ["L", "S", "O", "Z", "J"],
+    pieceCounter: null,
+    pieceCounterSource: "derived-revision",
+    linesCleared: undefined
+  };
+  assert.equal(resolveSoloDerivedPlacedPieces(sessionState, advanced, { stateRevision: 1 }), 1);
+  assert.equal(resolveSoloDerivedPlacedPieces(sessionState, advanced, { stateRevision: 1 }), 1);
+});
+
+test("resolveSoloDerivedPlacedPieces resets after new session", () => {
+  const sessionState = createSessionState();
+  updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-1",
+    gameObjectId: "object-1"
+  });
+  resolveSoloDerivedPlacedPieces(
+    sessionState,
+    {
+      field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+      current: "I",
+      hold: null,
+      queue: ["T", "L", "S", "O", "Z"],
+      pieceCounter: null,
+      pieceCounterSource: "derived-revision",
+      linesCleared: undefined
+    },
+    { stateRevision: 0 }
+  );
+  resetSessionState(sessionState);
+  updateSessionState(sessionState, {
+    playing: true,
+    gameId: "solo-2",
+    gameObjectId: "object-2"
+  });
+  assert.equal(
+    resolveSoloDerivedPlacedPieces(
+      sessionState,
+      {
+        field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+        current: "J",
+        hold: null,
+        queue: ["I", "T", "L", "S", "O"],
+        pieceCounter: null,
+        pieceCounterSource: "derived-revision",
+        linesCleared: undefined
+      },
+      { stateRevision: 0 }
+    ),
+    0
+  );
 });
 
 test("buildSoloSpawnSignature is stable across movement-only changes", () => {
@@ -421,6 +577,44 @@ test("readTetrioState does not probe with debugger after a valid cached game sta
   assert.equal(state.ok, true);
   assert.equal(state.pieceCounter, 0);
   assert.equal(captureCalled, false);
+});
+
+test("readTetrioState preserves linesCleared zero from direct solo paths", async () => {
+  const cdp = {
+    async send(method) {
+      if (method === "Runtime.evaluate") {
+        return {
+          result: {
+            value: {
+              ok: true,
+              ready: true,
+              playing: true,
+              countdown: false,
+              field: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => false)),
+              current: "t",
+              hold: null,
+              queue: ["l", "s", "o"],
+              pieceCounter: null,
+              pieceCounterSource: "derived-revision",
+              linesCleared: 0,
+              gameId: "solo-1",
+              gameObjectId: "object-1"
+            }
+          }
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    }
+  };
+
+  const state = await readTetrioState(cdp, {
+    probePageState: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: "" },
+    probeState: { lastCaptureAt: 0 }
+  });
+
+  assert.equal(state.linesCleared, 0);
 });
 
 test("markCurrentGameAsEnded keeps ended cache and removes live cache only", async () => {

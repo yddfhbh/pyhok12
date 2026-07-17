@@ -60,6 +60,7 @@ class NormalizedSnapshot:
     piece_counter: int | None
     piece_counter_source: str
     lines_cleared: int | None
+    derived_placed_pieces: int | None
     state_revision: int
     game_id: str | None
     round_id: str | None
@@ -130,20 +131,61 @@ def count_fixed_board_cells(board):
     return sum(1 for row in (board or []) for cell in row if cell != ".")
 
 
-def resolve_effective_piece_progress(snapshot):
+def is_piece_counter_source_transition_allowed(previous_source, current_source):
+    previous = str(previous_source or "").strip()
+    current = str(current_source or "").strip()
+    if not current:
+        return False
+    if not previous or previous == current:
+        return True
+    if previous == "derived-revision" and current != "derived-revision":
+        return True
+    return False
+
+
+def resolve_effective_piece_progress_details(snapshot):
+    details = {
+        "pieces_count": None,
+        "source": None,
+        "failure_reason": None,
+        "fixed_cells": count_fixed_board_cells(snapshot.board) if snapshot is not None else 0,
+        "lines_cleared": snapshot.lines_cleared if snapshot is not None else None,
+        "derived_placed_pieces": snapshot.derived_placed_pieces if snapshot is not None else None,
+    }
     if snapshot is None:
-        return None
+        details["failure_reason"] = "pieceCounter/linesCleared 없음"
+        return details
+
     if snapshot.piece_counter is not None:
-        return int(snapshot.piece_counter)
+        details["pieces_count"] = int(snapshot.piece_counter)
+        details["source"] = "piece-counter"
+        return details
+
     if str(snapshot.mode or "").strip().lower() != "solo":
-        return None
-    if snapshot.lines_cleared is None:
-        return None
-    fixed_cells = count_fixed_board_cells(snapshot.board)
-    numerator = fixed_cells + int(snapshot.lines_cleared) * 10
-    if numerator < 0 or numerator % 4 != 0:
-        return None
-    return numerator // 4
+        details["failure_reason"] = "pieceCounter/linesCleared 없음"
+        return details
+
+    if snapshot.lines_cleared is not None:
+        numerator = details["fixed_cells"] + int(snapshot.lines_cleared) * 10
+        if numerator >= 0 and numerator % 4 == 0:
+            details["pieces_count"] = numerator // 4
+            details["source"] = "board-lines"
+            return details
+        details["failure_reason"] = "진행값 불일치"
+
+    if snapshot.derived_placed_pieces is not None:
+        details["pieces_count"] = int(snapshot.derived_placed_pieces)
+        details["source"] = "derived-spawn-counter"
+        details["failure_reason"] = None
+        return details
+
+    if details["failure_reason"] is None:
+        details["failure_reason"] = "pieceCounter/linesCleared 없음"
+    return details
+
+
+def resolve_effective_piece_progress(snapshot):
+    return resolve_effective_piece_progress_details(snapshot)["pieces_count"]
 
 
 def _normalize_piece(value, allow_none=False):
@@ -311,6 +353,16 @@ def normalize_snapshot_payload(
         ),
     )
     piece_counter = piece_counter_raw
+    derived_placed_pieces = _extract_nonnegative_int(
+        payload,
+        (
+            "derivedPlacedPieces",
+            "derived_placed_pieces",
+            "derived.piecesPlaced",
+            "state.derivedPlacedPieces",
+            "gameState.derivedPlacedPieces",
+        ),
+    )
 
     game_id = str(payload.get("gameId")).strip() if payload.get("gameId") is not None else None
     round_id = str(payload.get("roundId")).strip() if payload.get("roundId") is not None else None
@@ -336,6 +388,7 @@ def normalize_snapshot_payload(
         piece_counter=piece_counter,
         piece_counter_source=piece_counter_source,
         lines_cleared=lines_cleared,
+        derived_placed_pieces=derived_placed_pieces,
         state_revision=state_revision,
         game_id=game_id,
         round_id=round_id,
@@ -503,7 +556,8 @@ class TetrioStateSource:
         snapshot = self.get_latest_valid_snapshot()
         if snapshot is None:
             return None
-        pieces_count = resolve_effective_piece_progress(snapshot)
+        progress_details = resolve_effective_piece_progress_details(snapshot)
+        pieces_count = progress_details["pieces_count"]
         return {
             "board": snapshot.board,
             "current": snapshot.current,
@@ -514,6 +568,11 @@ class TetrioStateSource:
             "pc_round": calculate_pc_round(pieces_count),
             "piece_counter": snapshot.piece_counter,
             "piece_counter_source": snapshot.piece_counter_source,
+            "lines_cleared": snapshot.lines_cleared,
+            "derived_placed_pieces": snapshot.derived_placed_pieces,
+            "fixed_cells": progress_details["fixed_cells"],
+            "piece_progress_source": progress_details["source"],
+            "pc_failure_reason": progress_details["failure_reason"],
             "state_revision": snapshot.state_revision,
             "snapshot": snapshot,
         }
@@ -580,7 +639,10 @@ class TetrioStateSource:
 
             if (
                 self._last_piece_counter_source is not None
-                and snapshot.piece_counter_source != self._last_piece_counter_source
+                and not is_piece_counter_source_transition_allowed(
+                    self._last_piece_counter_source,
+                    snapshot.piece_counter_source,
+                )
             ):
                 self.last_reason = "같은 세션에서 pieceCounter source가 변경되었습니다."
                 self._remember_error(self.last_reason)

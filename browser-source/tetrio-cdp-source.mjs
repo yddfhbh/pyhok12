@@ -214,6 +214,61 @@ export function buildSoloSpawnSignature(state) {
   ].join("|");
 }
 
+export function countOccupiedFieldCells(field) {
+  if (!Array.isArray(field)) {
+    return 0;
+  }
+  let count = 0;
+  for (const row of field) {
+    if (!Array.isArray(row)) {
+      continue;
+    }
+    for (const cell of row) {
+      if (cell) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function normalizeSoloQueue(queue) {
+  if (!Array.isArray(queue)) {
+    return [];
+  }
+  return queue.map((piece) => normalizeSoloPieceValue(piece)).filter(Boolean);
+}
+
+function normalizedLinesCleared(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function isValidSoloInitialHoldState(hold) {
+  return hold === null || hold === "" || hold === undefined || Boolean(normalizeSoloPieceValue(hold));
+}
+
+function didSoloQueueAdvanceByOne(previousQueue, nextQueue) {
+  if (!Array.isArray(previousQueue) || !Array.isArray(nextQueue)) {
+    return false;
+  }
+  const compareLength = Math.min(previousQueue.length - 1, nextQueue.length);
+  if (compareLength <= 0) {
+    return false;
+  }
+  for (let index = 0; index < compareLength; index += 1) {
+    if ((previousQueue[index + 1] ?? null) !== (nextQueue[index] ?? null)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function updateDerivedPlacedPiecesObservation(sessionState, { current, hold, queue }) {
+  sessionState.lastDerivedCurrent = current ?? "";
+  sessionState.lastDerivedHold = hold ?? "";
+  sessionState.lastDerivedQueue = Array.isArray(queue) ? [...queue] : [];
+}
+
 export function selectSoloPieceCounterCandidate({
   state = null,
   boardState = null,
@@ -241,6 +296,33 @@ export function selectSoloPieceCounterCandidate({
   return { value: null, source: "derived-revision" };
 }
 
+export function selectSoloLinesClearedCandidate({
+  state = null,
+  boardState = null,
+  exported = null,
+  gameState = null
+} = {}) {
+  const sources = [
+    ["state.lines", state?.lines],
+    ["state.linesCleared", state?.linesCleared],
+    ["state.stats.lines", state?.stats?.lines],
+    ["state.stats.linesCleared", state?.stats?.linesCleared],
+    ["exported.game.lines", exported?.game?.lines],
+    ["exported.game.stats.lines", exported?.game?.stats?.lines],
+    ["boardState.lines", boardState?.lines],
+    ["gameState.lines", gameState?.lines],
+    ["gameState.linesCleared", gameState?.linesCleared],
+    ["gameState.stats.lines", gameState?.stats?.lines],
+    ["gameState.stats.linesCleared", gameState?.stats?.linesCleared]
+  ];
+  for (const [source, value] of sources) {
+    if (Number.isInteger(value) && value >= 0) {
+      return { value, source };
+    }
+  }
+  return { value: null, source: "" };
+}
+
 export function createSessionState() {
   return {
     sessionSerial: 0,
@@ -252,7 +334,12 @@ export function createSessionState() {
     lastPieceCounterSource: "",
     seenGameSinceReset: false,
     lastStateRevision: -1,
-    lastDerivedSpawnSignature: ""
+    lastDerivedSpawnSignature: "",
+    derivedPlacedPieces: null,
+    derivedPlacedPiecesInitialized: false,
+    lastDerivedCurrent: "",
+    lastDerivedHold: "",
+    lastDerivedQueue: []
   };
 }
 
@@ -266,6 +353,11 @@ export function resetSessionState(sessionState) {
   sessionState.seenGameSinceReset = false;
   sessionState.lastStateRevision = -1;
   sessionState.lastDerivedSpawnSignature = "";
+  sessionState.derivedPlacedPieces = null;
+  sessionState.derivedPlacedPiecesInitialized = false;
+  sessionState.lastDerivedCurrent = "";
+  sessionState.lastDerivedHold = "";
+  sessionState.lastDerivedQueue = [];
   return sessionState;
 }
 
@@ -320,6 +412,13 @@ export function acceptPieceCounterSource(sessionState, source) {
     sessionState.lastPieceCounterSource = normalizedSource;
     return true;
   }
+  if (
+    sessionState.lastPieceCounterSource === "derived-revision" &&
+    normalizedSource !== "derived-revision"
+  ) {
+    sessionState.lastPieceCounterSource = normalizedSource;
+    return true;
+  }
   return sessionState.lastPieceCounterSource === normalizedSource;
 }
 
@@ -349,6 +448,64 @@ export function resolveSoloStateRevision(sessionState, state) {
     sessionState.lastStateRevision += 1;
   }
   return Math.max(0, sessionState.lastStateRevision);
+}
+
+export function resolveSoloDerivedPlacedPieces(
+  sessionState,
+  state,
+  { stateRevision = null } = {}
+) {
+  const numericCounter =
+    Number.isInteger(state?.pieceCounter) &&
+    state.pieceCounter >= 0 &&
+    state?.pieceCounterSource !== "derived-revision"
+      ? state.pieceCounter
+      : null;
+  if (numericCounter !== null) {
+    sessionState.derivedPlacedPieces = numericCounter;
+    sessionState.derivedPlacedPiecesInitialized = true;
+    updateDerivedPlacedPiecesObservation(sessionState, {
+      current: normalizeSoloPieceValue(state?.current) ?? "",
+      hold: normalizeSoloPieceValue(state?.hold) ?? "",
+      queue: normalizeSoloQueue(state?.queue)
+    });
+    return numericCounter;
+  }
+
+  const current = normalizeSoloPieceValue(state?.current) ?? "";
+  const hold = normalizeSoloPieceValue(state?.hold) ?? "";
+  const queue = normalizeSoloQueue(state?.queue);
+  const fixedCells = countOccupiedFieldCells(state?.field ?? []);
+  const linesCleared = normalizedLinesCleared(state?.linesCleared);
+  const openingState =
+    stateRevision === 0 &&
+    fixedCells === 0 &&
+    current &&
+    queue.length > 0 &&
+    isValidSoloInitialHoldState(hold) &&
+    linesCleared === null;
+
+  if (!sessionState.derivedPlacedPiecesInitialized) {
+    updateDerivedPlacedPiecesObservation(sessionState, { current, hold, queue });
+    if (openingState) {
+      sessionState.derivedPlacedPiecesInitialized = true;
+      sessionState.derivedPlacedPieces = 0;
+      return 0;
+    }
+    return null;
+  }
+
+  if (didSoloQueueAdvanceByOne(sessionState.lastDerivedQueue, queue)) {
+    sessionState.derivedPlacedPieces = Math.max(
+      0,
+      Number.isInteger(sessionState.derivedPlacedPieces) ? sessionState.derivedPlacedPieces + 1 : 1
+    );
+  }
+
+  updateDerivedPlacedPiecesObservation(sessionState, { current, hold, queue });
+  return Number.isInteger(sessionState.derivedPlacedPieces)
+    ? sessionState.derivedPlacedPieces
+    : null;
 }
 
 export function buildTombstoneSnapshot({
@@ -861,6 +1018,9 @@ async function main() {
       lastReasonAt = 0;
 
       const stateRevision = resolveSoloStateRevision(sessionState, state);
+      const derivedPlacedPieces = resolveSoloDerivedPlacedPieces(sessionState, state, {
+        stateRevision
+      });
       const pieceKey = `${sessionId}:${stateRevision}`;
       if (pieceKey !== snapshotTracking.pendingPieceKey) {
         snapshotTracking.pendingPieceKey = pieceKey;
@@ -899,6 +1059,14 @@ async function main() {
         incoming: state.incoming,
         pieceCounter: Number.isInteger(state.pieceCounter) ? state.pieceCounter : null,
         pieceCounterSource: state.pieceCounterSource,
+        linesCleared:
+          Number.isInteger(state.linesCleared) && state.linesCleared >= 0
+            ? state.linesCleared
+            : undefined,
+        derivedPlacedPieces:
+          Number.isInteger(derivedPlacedPieces) && derivedPlacedPieces >= 0
+            ? derivedPlacedPieces
+            : undefined,
         stateRevision,
         token: buildIdentityToken(sessionId, stateRevision),
         countdown: state.countdown,
@@ -925,7 +1093,7 @@ async function main() {
         if (snapshot.token !== snapshotTracking.lastLoggedToken) {
           snapshotTracking.lastLoggedToken = snapshot.token;
           console.log(
-            `[browser] page state ready pieceCounter=${snapshot.pieceCounter ?? "null"} stateRevision=${stateRevision} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
+            `[browser] page state ready pieceCounter=${snapshot.pieceCounter ?? "null"} linesCleared=${snapshot.linesCleared ?? "null"} derivedPlacedPieces=${snapshot.derivedPlacedPieces ?? "null"} stateRevision=${stateRevision} current=${snapshot.current} hold=${snapshot.hold ?? "-"} queue=${snapshot.queue.join(",")}`
           );
         }
       }
@@ -3843,17 +4011,23 @@ export function tetrioStateExpression() {
         break;
       }
     }
-
-    const linesClearedRaw = numberFrom(
+    const linesClearedCandidates = [
+      state?.lines,
+      state?.linesCleared,
       stats.lines,
       stats.linesCleared,
-      stats.lines_cleared,
-      state?.stats?.lines,
-      state?.stats?.linesCleared,
-      state?.stats?.lines_cleared
-    );
-    const linesCleared =
-      linesClearedRaw === null ? null : Math.max(0, Math.floor(linesClearedRaw));
+      exported?.game?.lines,
+      exported?.game?.stats?.lines,
+      boardState?.lines,
+      boardState?.stats?.lines
+    ];
+    let linesCleared = null;
+    for (const value of linesClearedCandidates) {
+      if (Number.isInteger(value) && value >= 0) {
+        linesCleared = value;
+        break;
+      }
+    }
     const activeX = integerFrom(
       activeState?.x,
       activeState?.col,
@@ -3902,7 +4076,7 @@ export function tetrioStateExpression() {
       incoming: Math.max(0, numberFrom(stats.impendingdamage, state.incoming, 0) ?? 0),
       pieceCounter,
       pieceCounterSource,
-      linesCleared: linesCleared ?? undefined,
+      linesCleared: linesCleared === null ? undefined : linesCleared,
       playing,
       countdown,
       activeX,
