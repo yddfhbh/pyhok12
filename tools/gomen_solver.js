@@ -64,6 +64,10 @@ function buildQueue(wasmBindgen, queueText) {
 }
 
 function solve(runtime, request) {
+  if (request && String(request.mode || "").toLowerCase() === "state") {
+    return solveState(runtime, request);
+  }
+
   const queueText = String(request.queue || "").trim().toUpperCase();
   const targetQueue = String(request.target_queue || "").trim().toUpperCase();
   const garbage = BigInt(String(request.garbage || "0"));
@@ -90,7 +94,7 @@ function solve(runtime, request) {
     let matchedGroup = "";
 
     if (id) {
-      const info = runtime.wasmBindgen.solution_info(id);
+      const info = runtime.wasmBindgen.solution_info_with_physics(id, physics);
       const parts = String(info || "").split("|");
       orderGroups = parts
         .slice(1)
@@ -139,6 +143,55 @@ function solve(runtime, request) {
     matched_total: matchedSolutions.length,
     shown_total: solutions.length,
     exact_match_used: !targetQueue || matchedSolutions.length > 0,
+    solutions,
+  };
+}
+
+function solveState(runtime, request) {
+  const current = String(request.current || "").trim().toUpperCase();
+  const initialHold = String(request.initial_hold || "").trim().toUpperCase();
+  const nextQueue = String(request.next_queue || "").trim().toUpperCase();
+  const garbage = BigInt(String(request.garbage || "0"));
+  const canHold = request.can_hold !== false;
+  const physics = String(request.physics || "TETRIO");
+  const limit = Math.max(1, Math.min(12, Number(request.limit || 6)));
+
+  if (!/^[IJLOSTZ]$/.test(current)) {
+    throw new Error("current is required");
+  }
+  if (initialHold && !/^[IJLOSTZ]$/.test(initialHold)) {
+    throw new Error("initial_hold must be empty or a single piece");
+  }
+  if (nextQueue && /[^IJLOSTZ]/.test(nextQueue)) {
+    throw new Error("next_queue contains invalid piece");
+  }
+
+  const startedAt = Date.now();
+  const rawText = runtime.solver.solve_state(
+    nextQueue,
+    garbage,
+    current,
+    initialHold,
+    canHold,
+    physics
+  );
+  const parsed = JSON.parse(String(rawText || "[]"));
+  const allSolutions = Array.isArray(parsed) ? parsed : [];
+  const solutions = allSolutions.slice(0, limit).map((solution) => ({
+    ...solution,
+    matched_group: "exact_state",
+    order_groups: [],
+  }));
+
+  return {
+    ok: true,
+    fast: !!runtime.solver.is_fast(garbage),
+    mode: "state",
+    duration_ms: Date.now() - startedAt,
+    total: allSolutions.length,
+    matched_total: allSolutions.length,
+    shown_total: solutions.length,
+    exact_match_used: true,
     solutions,
   };
 }

@@ -91,3 +91,36 @@ node --check browser-source\vs-ws-bridge.mjs
 ```powershell
 py -3 -m unittest tests.test_tetrio_state_source
 ```
+
+## Gomen WASM 재빌드
+
+이 프로젝트는 `tools/gomen.js` 와 `tools/gomen_bg.wasm` 을 직접 읽습니다.
+Gomen Rust/WASM 수정 후에는 두 산출물을 함께 다시 만들어야 합니다.
+
+확인한 빌드 환경:
+
+- Rust `1.96.0`
+- Cargo `1.96.0`
+- `wasm-pack`
+
+초기 1회 준비:
+
+```powershell
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+```
+
+빌드:
+
+```powershell
+Set-Location tools\gomen-rs\gomen
+wasm-pack build --release --target no-modules --out-dir ..\..\tools --out-name gomen
+Copy-Item -LiteralPath ..\..\tools\gomen.js -Destination ..\..\gomen.js -Force
+Copy-Item -LiteralPath ..\..\tools\gomen_bg.wasm -Destination ..\..\gomen_bg.wasm -Force
+```
+
+`wasm-pack` 결과가 `tools\tools\` 아래에 생성될 수 있으므로,
+최종적으로 앱이 읽는 경로가 아래 두 파일인지 확인해야 합니다.
+
+- `tools/gomen.js`
+- `tools/gomen_bg.wasm`

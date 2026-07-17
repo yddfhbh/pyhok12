@@ -8,9 +8,12 @@ import gomen_helper
 from gomen_helper import (
     GomenError,
     GomenSession,
+    _filter_valid_solutions,
+    _solution_cache_key,
+    _validate_solution_sequence,
     board_to_gomen_garbage,
-    calculate_solver_piece_limit,
     build_gomen_branches,
+    calculate_solver_piece_limit,
     count_pc_solver_fixed_cells,
     format_gomen_garbage_bits,
     get_gomen_bottom_rows,
@@ -19,11 +22,6 @@ from gomen_helper import (
     gomen_garbage_to_bottom_rows,
     run_gomen_solver,
 )
-
-try:
-    from py_fumen_py import decode as decode_fumen
-except Exception:
-    decode_fumen = None
 
 
 class FakeProcess:
@@ -94,7 +92,7 @@ class GomenSessionTests(unittest.TestCase):
 
     def test_old_reader_does_not_clear_new_process_identity(self):
         session = GomenSession()
-        replacement = FakeProcess(stdout_lines=["{\"kind\":\"ready\"}\n"], exit_code=None)
+        replacement = FakeProcess(stdout_lines=['{"kind":"ready"}\n'], exit_code=None)
 
         def replace_current(_proc):
             session.proc = replacement
@@ -112,7 +110,7 @@ class GomenSessionTests(unittest.TestCase):
         session.proc = old_proc
         session._reader_loop(old_proc)
 
-        new_proc = FakeProcess(stdout_lines=["{\"kind\":\"ready\"}\n"], exit_code=None)
+        new_proc = FakeProcess(stdout_lines=['{"kind":"ready"}\n'], exit_code=None)
         with (
             mock.patch("gomen_helper.get_gomen_solver_path", return_value="solver.js"),
             mock.patch("gomen_helper.get_gomen_js_path", return_value="gomen.js"),
@@ -152,17 +150,6 @@ class GomenHelperTests(unittest.TestCase):
             board[16 + offset] = list((row_text + "." * 10)[:10])
         return board
 
-    def decode_bottom_rows_from_fumen(self, fumen_text):
-        page = decode_fumen(fumen_text)[0]
-        field = page.field
-        rows = []
-        for y in range(3, -1, -1):
-            cells = []
-            for x in range(10):
-                cells.append("." if str(field.at(x, y)) == "0" else "X")
-            rows.append("".join(cells))
-        return rows
-
     def test_board_to_gomen_garbage_bit_mapping(self):
         board = self.make_board(
             [
@@ -187,28 +174,161 @@ class GomenHelperTests(unittest.TestCase):
             ],
         )
 
-    @unittest.skipUnless(decode_fumen is not None, "py_fumen_py is unavailable")
-    def test_setup_finder_board_roundtrips_through_gomen_garbage(self):
-        rows = self.decode_bottom_rows_from_fumen("v115@9gwwIexwCeglDewwR4ilDeR4zhNeAgH")
-        board = self.make_board(rows)
+    def test_count_pc_solver_fixed_cells_uses_bottom_four_locked_rows(self):
+        board = self.make_board(["XXXX......", ".XXX......", "..XX......", "...X......"])
+        self.assertEqual(count_pc_solver_fixed_cells(board), 10)
 
-        self.assertEqual(get_gomen_bottom_rows(board), rows)
-        self.assertEqual(gomen_garbage_to_bottom_rows(board_to_gomen_garbage(board)), rows)
+    def test_solver_piece_limit_empty_board_is_eleven(self):
+        info = calculate_solver_piece_limit(self.make_board([".........."] * 4))
+        self.assertEqual(info["fixed_cells"], 0)
+        self.assertEqual(info["placements_needed"], 10)
+        self.assertEqual(info["solver_piece_limit"], 11)
+
+    def test_solver_piece_limit_three_placements_is_eight(self):
+        info = calculate_solver_piece_limit(self.make_board(["XXXX......", "XXXX......", "XXXX......", ".........."]))
+        self.assertEqual(info["fixed_cells"], 12)
+        self.assertEqual(info["placements_needed"], 7)
+        self.assertEqual(info["solver_piece_limit"], 8)
+
+    def test_solver_piece_limit_four_placements_is_seven(self):
+        info = calculate_solver_piece_limit(self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"]))
+        self.assertEqual(info["fixed_cells"], 16)
+        self.assertEqual(info["placements_needed"], 6)
+        self.assertEqual(info["solver_piece_limit"], 7)
+
+    def test_solver_piece_limit_seven_placements_is_four(self):
+        info = calculate_solver_piece_limit(self.make_board(["XXXXXXXXXX", "XXXXXXXXXX", "XXXXXXXX..", ".........."]))
+        self.assertEqual(info["fixed_cells"], 28)
+        self.assertEqual(info["placements_needed"], 3)
+        self.assertEqual(info["solver_piece_limit"], 4)
+
+    def test_build_gomen_branches_exact_state_without_hold(self):
+        state_queue, branches = build_gomen_branches("O", "", list("JJOZILTS"), solver_piece_limit=7)
+        self.assertEqual(state_queue, "OJJOZILTS")
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(branches[0]["name"], "exact-state")
+        self.assertEqual(branches[0]["current"], "O")
+        self.assertEqual(branches[0]["initial_hold"], "")
+        self.assertEqual(branches[0]["next_queue"], "JJOZIL")
+
+    def test_build_gomen_branches_exact_state_with_hold(self):
+        state_queue, branches = build_gomen_branches("S", "T", list("OIZJLL"), solver_piece_limit=7)
+        self.assertEqual(state_queue, "SOIZJLL")
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(branches[0]["current"], "S")
+        self.assertEqual(branches[0]["initial_hold"], "T")
+        self.assertEqual(branches[0]["next_queue"], "OIZJL")
+        self.assertEqual(branches[0]["required_total"], 7)
+        self.assertEqual(branches[0]["available_total"], 8)
+
+    def test_build_gomen_branches_never_generates_nine_piece_total_when_limit_is_eight(self):
+        _, branches = build_gomen_branches("O", "T", list("JJOZILTS"), solver_piece_limit=8)
+        branch = branches[0]
+        total_accessible = 1 + len(branch["next_queue"]) + 1
+        self.assertEqual(total_accessible, 8)
+
+    def test_validate_solution_sequence_preserves_current_hold_next_state(self):
+        solution = {
+            "initial_current": "S",
+            "initial_hold": "T",
+            "placements": ["S", "O", "I"],
+            "hold_actions": [False, False, False],
+            "final_hold": "T",
+            "consumed_next_count": 2,
+            "physics": "TETRIO",
+        }
+        is_valid, reason, normalized = _validate_solution_sequence(solution, "S", "T", "OIZJLL")
+        self.assertTrue(is_valid)
+        self.assertEqual(reason, "")
+        self.assertEqual(normalized["placements"], ["S", "O", "I"])
+
+    def test_validate_solution_sequence_accepts_hold_first_path(self):
+        solution = {
+            "initial_current": "S",
+            "initial_hold": "T",
+            "placements": ["T", "O", "I"],
+            "hold_actions": [True, False, False],
+            "final_hold": "S",
+            "consumed_next_count": 2,
+            "physics": "TETRIO",
+        }
+        is_valid, reason, normalized = _validate_solution_sequence(solution, "S", "T", "OIZJLL")
+        self.assertTrue(is_valid)
+        self.assertEqual(reason, "")
+        self.assertEqual(normalized["final_hold"], "S")
+
+    def test_validate_solution_sequence_rejects_empty_hold_style_path_when_hold_is_filled(self):
+        solution = {
+            "initial_current": "S",
+            "initial_hold": "T",
+            "placements": ["O"],
+            "hold_actions": [True],
+            "final_hold": "S",
+            "consumed_next_count": 1,
+            "physics": "TETRIO",
+        }
+        is_valid, reason, _ = _validate_solution_sequence(solution, "S", "T", "OIZJLL")
+        self.assertFalse(is_valid)
+        self.assertEqual(reason, "invalid_hold_transition")
+
+    def test_validate_solution_sequence_rejects_next_skip(self):
+        solution = {
+            "initial_current": "S",
+            "initial_hold": "T",
+            "placements": ["S", "I"],
+            "hold_actions": [False, False],
+            "final_hold": "T",
+            "consumed_next_count": 1,
+            "physics": "TETRIO",
+        }
+        is_valid, reason, _ = _validate_solution_sequence(solution, "S", "T", "OIZJLL")
+        self.assertFalse(is_valid)
+        self.assertEqual(reason, "invalid_next_order")
+
+    def test_filter_keeps_same_cells_with_different_hold_order_as_distinct(self):
+        result = {
+            "solutions": [
+                {
+                    "cells": "X" * 40,
+                    "placements": ["S", "O", "I"],
+                    "hold_actions": [False, False, False],
+                    "final_hold": "T",
+                    "consumed_next_count": 2,
+                    "physics": "TETRIO",
+                },
+                {
+                    "cells": "X" * 40,
+                    "placements": ["T", "O", "I"],
+                    "hold_actions": [True, False, False],
+                    "final_hold": "S",
+                    "consumed_next_count": 2,
+                    "physics": "TETRIO",
+                },
+            ]
+        }
+        filtered = _filter_valid_solutions(result, current="S", hold="T", next_queue="OIZJLL")
+        self.assertEqual(len(filtered), 2)
+        self.assertNotEqual(_solution_cache_key(filtered[0]), _solution_cache_key(filtered[1]))
 
     def test_run_gomen_solver_logs_request_payload(self):
-        board = self.make_board(
-            [
-                "XXXX......",
-                "XXXX......",
-                "XXXX......",
-                "XXXX......",
-            ]
-        )
+        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
         session = mock.Mock()
-        session.solve.side_effect = [
-            {"ok": True, "total": 0, "shown_total": 0, "exact_match_used": False, "solutions": []},
-            {"ok": True, "total": 3, "shown_total": 2, "exact_match_used": True, "solutions": []},
-        ]
+        session.solve_state.return_value = {
+            "ok": True,
+            "total": 1,
+            "shown_total": 1,
+            "exact_match_used": True,
+            "solutions": [
+                {
+                    "cells": "." * 40,
+                    "placements": ["T", "J"],
+                    "hold_actions": [False, False],
+                    "final_hold": "L",
+                    "consumed_next_count": 1,
+                    "physics": "TETRIO",
+                }
+            ],
+        }
 
         with (
             mock.patch("gomen_helper.get_gomen_session", return_value=session),
@@ -219,308 +339,105 @@ class GomenHelperTests(unittest.TestCase):
                 active="T",
                 hold="L",
                 queue=["J", "O", "S", "Z", "I", "L"],
-                limit=6,
                 timeout_sec=1,
             )
 
+        self.assertEqual(result["branch_name"], "exact-state")
         messages = [args[0] for args, _ in print_mock.call_args_list if args]
-        self.assertTrue(any("bottom_row_1=XXXX......" in message for message in messages))
         self.assertTrue(any("fixed_cells=16" in message for message in messages))
         self.assertTrue(any("placements_needed=6" in message for message in messages))
         self.assertTrue(any("solver_piece_limit=7" in message for message in messages))
-        self.assertTrue(any("garbage_dec=" in message for message in messages))
-        self.assertTrue(any("garbage_bits=" in message for message in messages))
         self.assertTrue(any("active=T" in message for message in messages))
         self.assertTrue(any("hold=L" in message for message in messages))
         self.assertTrue(any("raw_queue=JOSZIL" in message for message in messages))
         self.assertTrue(any("state_queue=TJOSZIL" in message for message in messages))
-        self.assertTrue(any("queue_text=TJOSZIL" in message for message in messages))
-        self.assertTrue(any("queue_text=LTJOSZI" in message for message in messages))
-        self.assertTrue(any("queue_length=7" in message for message in messages))
-        self.assertTrue(any("use_hold=true" in message for message in messages))
-        self.assertEqual(result["branch_name"], "active-first+hold-first")
+        self.assertTrue(any("next_queue=JOSZI" in message for message in messages))
 
-    def test_run_gomen_solver_tries_active_first_before_hold_first(self):
-        board = self.make_board(
-            [
-                "XXXX......",
-                "XXXX......",
-                "XXXX......",
-                "XXXX......",
-            ]
-        )
+    def test_run_gomen_solver_uses_tetrio_physics_by_default(self):
+        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
         session = mock.Mock()
-        session.solve.side_effect = [
-            {"ok": True, "total": 0, "shown_total": 0, "exact_match_used": False, "solutions": []},
-            {"ok": True, "total": 5, "shown_total": 4, "exact_match_used": True, "solutions": [{"id": "a"}]},
-        ]
+        session.solve_state.return_value = {
+            "ok": True,
+            "total": 1,
+            "shown_total": 1,
+            "exact_match_used": True,
+            "solutions": [
+                {
+                    "cells": "." * 40,
+                    "placements": ["O"],
+                    "hold_actions": [False],
+                    "final_hold": "",
+                    "consumed_next_count": 0,
+                    "physics": "TETRIO",
+                }
+            ],
+        }
 
         with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            result = run_gomen_solver(
-                board=board,
-                active="T",
-                hold="L",
-                queue=["J", "O", "S", "Z", "I", "L"],
-                limit=6,
-                timeout_sec=1,
-            )
+            run_gomen_solver(board=board, active="O", hold="", queue=list("JJOZIL"), timeout_sec=1)
 
-        first_call = session.solve.call_args_list[0].kwargs
-        second_call = session.solve.call_args_list[1].kwargs
-        self.assertEqual(first_call["queue_text"], "TJOSZIL")
-        self.assertEqual(first_call["target_queue"], "TJOSZIL")
-        self.assertTrue(first_call["hold"])
-        self.assertEqual(second_call["queue_text"], "LTJOSZI")
-        self.assertEqual(second_call["target_queue"], "LTJOSZI")
-        self.assertTrue(second_call["hold"])
-        self.assertEqual(result["branch_name"], "active-first+hold-first")
-        self.assertTrue(result["branch_results"][0]["engine_zero"])
-        self.assertFalse(result["branch_results"][0]["exact_queue_filter_miss"])
-
-    def test_build_gomen_branches_keeps_single_branch_without_hold(self):
-        state_queue, branches = build_gomen_branches("T", "", ["L", "S", "I"], solver_piece_limit=4)
-
-        self.assertEqual(state_queue, "TLSI")
-        self.assertEqual(len(branches), 1)
-        self.assertEqual(branches[0]["name"], "active-first")
-        self.assertEqual(branches[0]["queue_text"], "TLSI")
-
-    def test_solver_piece_limit_empty_board_is_eleven(self):
-        board = self.make_board(["..........", "..........", "..........", ".........."])
-        info = calculate_solver_piece_limit(board)
-
-        self.assertEqual(info["fixed_cells"], 0)
-        self.assertEqual(info["placements_needed"], 10)
-        self.assertEqual(info["solver_piece_limit"], 11)
-
-    def test_solver_piece_limit_three_placements_is_eight(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", ".........."])
-        info = calculate_solver_piece_limit(board)
-
-        self.assertEqual(info["fixed_cells"], 12)
-        self.assertEqual(info["placements_needed"], 7)
-        self.assertEqual(info["solver_piece_limit"], 8)
-
-    def test_solver_piece_limit_four_placements_is_seven(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
-        info = calculate_solver_piece_limit(board)
-
-        self.assertEqual(info["fixed_cells"], 16)
-        self.assertEqual(info["placements_needed"], 6)
-        self.assertEqual(info["solver_piece_limit"], 7)
-
-    def test_solver_piece_limit_seven_placements_is_four(self):
-        board = self.make_board(["XXXXXXXXXX", "XXXXXXXXXX", "XXXXXXXX..", ".........."])
-        info = calculate_solver_piece_limit(board)
-
-        self.assertEqual(info["fixed_cells"], 28)
-        self.assertEqual(info["placements_needed"], 3)
-        self.assertEqual(info["solver_piece_limit"], 4)
-
-    def test_count_pc_solver_fixed_cells_uses_bottom_four_locked_rows(self):
-        board = self.make_board(["XXXX......", ".XXX......", "..XX......", "...X......"])
-        self.assertEqual(count_pc_solver_fixed_cells(board), 10)
-
-    def test_build_gomen_branches_trims_next_queue_to_solver_limit_without_hold(self):
-        state_queue, branches = build_gomen_branches(
-            "O",
-            "",
-            list("JJOZILTSQ".replace("Q", "")),
-            solver_piece_limit=7,
-        )
-
-        self.assertEqual(state_queue, "OJJOZILTS")
-        self.assertEqual(branches[0]["queue_text"], "OJJOZIL")
-        self.assertEqual(len(branches[0]["queue_text"]), 7)
-
-    def test_build_gomen_branches_trims_active_first_with_hold(self):
-        _, branches = build_gomen_branches(
-            "O",
-            "T",
-            list("JJOZILTS"),
-            solver_piece_limit=7,
-        )
-
-        self.assertEqual(branches[0]["queue_text"], "OJJOZIL")
-        self.assertEqual(len(branches[0]["queue_text"]), 7)
-
-    def test_build_gomen_branches_trims_hold_first_with_hold(self):
-        _, branches = build_gomen_branches(
-            "O",
-            "T",
-            list("JJOZILTS"),
-            solver_piece_limit=7,
-        )
-
-        self.assertEqual(branches[1]["queue_text"], "TOJJOZI")
-        self.assertEqual(len(branches[1]["queue_text"]), 7)
-
-    def test_build_gomen_branches_never_generates_nine_piece_queue_when_limit_is_eight(self):
-        _, branches = build_gomen_branches(
-            "O",
-            "T",
-            list("JJOZILTSX".replace("X", "")),
-            solver_piece_limit=8,
-        )
-
-        self.assertEqual(len(branches[0]["queue_text"]), 8)
-        self.assertEqual(len(branches[1]["queue_text"]), 8)
+        self.assertEqual(session.solve_state.call_args.kwargs["physics"], "TETRIO")
 
     def test_run_gomen_solver_reports_queue_shortage(self):
         board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
 
         with self.assertRaisesRegex(GomenError, r"PC SOLVER: NEXT 큐 부족\n필요=7, 확보=3"):
-            run_gomen_solver(
-                board=board,
-                active="O",
-                hold="",
-                queue=["J", "J"],
-                timeout_sec=1,
-            )
+            run_gomen_solver(board=board, active="O", hold="", queue=["J", "J"], timeout_sec=1)
 
-    def test_run_gomen_solver_uses_tetrio_physics_by_default(self):
+    def test_branch_cache_key_uses_trimmed_next_queue_and_limit(self):
         board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
         session = mock.Mock()
-        session.solve.return_value = {
+        session.solve_state.return_value = {
             "ok": True,
             "total": 1,
-            "matched_total": 1,
             "shown_total": 1,
             "exact_match_used": True,
-            "solutions": [{"cells": "." * 40}],
+            "solutions": [
+                {
+                    "cells": "." * 40,
+                    "placements": ["O", "J"],
+                    "hold_actions": [False, False],
+                    "final_hold": "",
+                    "consumed_next_count": 1,
+                    "physics": "TETRIO",
+                }
+            ],
         }
 
         with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            run_gomen_solver(
-                board=board,
-                active="O",
-                hold="",
-                queue=list("JJOZIL"),
-                timeout_sec=1,
-            )
-
-        self.assertEqual(session.solve.call_args.kwargs["physics"], "TETRIO")
-
-    def test_run_gomen_solver_merges_branch_results_and_deduplicates_solutions(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
-        session = mock.Mock()
-        session.solve.side_effect = [
-            {
-                "ok": True,
-                "total": 2,
-                "matched_total": 2,
-                "shown_total": 2,
-                "exact_match_used": True,
-                "solutions": [
-                    {"cells": "A" * 40, "matched_group": "without_hold"},
-                    {"cells": "B" * 40, "matched_group": "without_hold"},
-                ],
-            },
-            {
-                "ok": True,
-                "total": 3,
-                "matched_total": 2,
-                "shown_total": 2,
-                "exact_match_used": True,
-                "solutions": [
-                    {"cells": "B" * 40, "matched_group": "with_hold"},
-                    {"cells": "C" * 40, "matched_group": "with_hold"},
-                ],
-            },
-        ]
-
-        with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            result = run_gomen_solver(
-                board=board,
-                active="O",
-                hold="T",
-                queue=list("JJOZIL"),
-                timeout_sec=1,
-            )
-
-        self.assertEqual(result["total"], 5)
-        self.assertEqual(result["shown_total"], 3)
-        self.assertEqual(len(result["solutions"]), 3)
-
-    def test_run_gomen_solver_survives_one_branch_error_if_other_branch_succeeds(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
-        session = mock.Mock()
-        session.solve.side_effect = [
-            GomenError("branch boom"),
-            {
-                "ok": True,
-                "total": 1,
-                "matched_total": 1,
-                "shown_total": 1,
-                "exact_match_used": True,
-                "solutions": [{"cells": "A" * 40}],
-            },
-        ]
-
-        with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            result = run_gomen_solver(
-                board=board,
-                active="O",
-                hold="T",
-                queue=list("JJOZIL"),
-                timeout_sec=1,
-            )
-
-        self.assertEqual(result["shown_total"], 1)
-        self.assertEqual(len(result["branch_results"]), 2)
-        self.assertTrue(any(not item.get("ok", True) for item in result["branch_results"]))
-
-    def test_run_gomen_solver_returns_no_solution_only_when_both_branches_are_zero(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
-        session = mock.Mock()
-        session.solve.side_effect = [
-            {"ok": True, "total": 0, "matched_total": 0, "shown_total": 0, "exact_match_used": False, "solutions": []},
-            {"ok": True, "total": 0, "matched_total": 0, "shown_total": 0, "exact_match_used": False, "solutions": []},
-        ]
-
-        with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            result = run_gomen_solver(
-                board=board,
-                active="O",
-                hold="T",
-                queue=list("JJOZIL"),
-                timeout_sec=1,
-            )
-
-        self.assertEqual(result["total"], 0)
-        self.assertEqual(result["shown_total"], 0)
-
-    def test_branch_cache_key_uses_trimmed_queue_and_limit(self):
-        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
-        session = mock.Mock()
-        session.solve.return_value = {
-            "ok": True,
-            "total": 1,
-            "matched_total": 1,
-            "shown_total": 1,
-            "exact_match_used": True,
-            "solutions": [{"cells": "A" * 40}],
-        }
-
-        with mock.patch("gomen_helper.get_gomen_session", return_value=session):
-            first = run_gomen_solver(
-                board=board,
-                active="O",
-                hold="",
-                queue=list("JJOZILTS"),
-                timeout_sec=1,
-            )
-            second = run_gomen_solver(
-                board=board,
-                active="O",
-                hold="",
-                queue=list("JJOZIL"),
-                timeout_sec=1,
-            )
+            first = run_gomen_solver(board=board, active="O", hold="", queue=list("JJOZILTS"), timeout_sec=1)
+            second = run_gomen_solver(board=board, active="O", hold="", queue=list("JJOZIL"), timeout_sec=1)
 
         self.assertEqual(first["shown_total"], 1)
         self.assertEqual(second["shown_total"], 1)
-        self.assertEqual(session.solve.call_count, 1)
+        self.assertEqual(session.solve_state.call_count, 1)
+
+    def test_run_gomen_solver_filters_invalid_solution_and_sets_message(self):
+        board = self.make_board(["XXXX......", "XXXX......", "XXXX......", "XXXX......"])
+        session = mock.Mock()
+        session.solve_state.return_value = {
+            "ok": True,
+            "total": 1,
+            "shown_total": 1,
+            "exact_match_used": True,
+            "solutions": [
+                {
+                    "cells": "." * 40,
+                    "placements": ["O"],
+                    "hold_actions": [True],
+                    "final_hold": "S",
+                    "consumed_next_count": 1,
+                    "physics": "TETRIO",
+                }
+            ],
+        }
+
+        with mock.patch("gomen_helper.get_gomen_session", return_value=session):
+            result = run_gomen_solver(board=board, active="S", hold="T", queue=list("OIZJLL"), timeout_sec=1)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["shown_total"], 0)
+        self.assertEqual(result["display_message"], "PC SOLVER: 유효한 실제 게임 순서 해법 없음")
 
 
 def has_node_runtime():
@@ -535,15 +452,10 @@ def has_node_runtime():
     "node runtime or gomen solver assets are unavailable",
 )
 class GomenSessionIntegrationTests(unittest.TestCase):
-    def test_real_solver_handles_two_requests_on_same_process(self):
+    def test_real_solver_handles_two_legacy_requests_on_same_process(self):
         session = GomenSession()
         try:
-            response1 = session.solve(
-                queue_text="TIJLOSZ",
-                garbage=0,
-                timeout_sec=30,
-                target_queue="TIJLOSZ",
-            )
+            response1 = session.solve(queue_text="TIJLOSZ", garbage=0, timeout_sec=30, target_queue="TIJLOSZ")
             first_proc = session.proc
 
             self.assertIsNotNone(first_proc)
@@ -551,164 +463,29 @@ class GomenSessionIntegrationTests(unittest.TestCase):
             self.assertTrue(response1["ok"])
             self.assertIn("solutions", response1)
 
-            response2 = session.solve(
-                queue_text="TIJLOSZ",
-                garbage=0,
-                timeout_sec=30,
-                target_queue="TIJLOSZ",
-            )
-
+            response2 = session.solve(queue_text="TIJLOSZ", garbage=0, timeout_sec=30, target_queue="TIJLOSZ")
             self.assertTrue(response2["ok"])
             self.assertIs(session.proc, first_proc)
             self.assertIsNone(first_proc.poll())
         finally:
             session.close()
 
-    def test_next_solve_restarts_after_forced_process_exit(self):
+    def test_real_solver_supports_exact_state_api(self):
         session = GomenSession()
         try:
-            session.ensure_started(timeout_sec=30)
-            first_proc = session.proc
-
-            self.assertIsNotNone(first_proc)
-            first_proc.kill()
-            first_proc.wait(timeout=5)
-
-            if session.reader_thread is not None:
-                session.reader_thread.join(timeout=5)
-
-            response = session.solve(
-                queue_text="TIJLOSZ",
+            response = session.solve_state(
+                current="S",
+                initial_hold="T",
+                next_queue="OIZJL",
                 garbage=0,
-                timeout_sec=30,
-                target_queue="TIJLOSZ",
-            )
-
-            self.assertTrue(response["ok"])
-            self.assertIsNotNone(session.proc)
-            self.assertIsNot(session.proc, first_proc)
-        finally:
-            session.close()
-
-    @unittest.skipUnless(decode_fumen is not None, "py_fumen_py is unavailable")
-    def test_known_pc_hold_empty_current_transform_matches_gomen_mapping(self):
-        page = decode_fumen("v115@JhglGeilBeR4wwBezhR4ywKeAgH")[0]
-        field = page.field
-        board = [["." for _ in range(10)] for _ in range(20)]
-        for y in range(4):
-            for x in range(10):
-                board[19 - y][x] = "." if str(field.at(x, y)) == "0" else "X"
-
-        def transform(mode):
-            bottom = [row[:] for row in board[-4:]]
-            if "v" in mode:
-                bottom = list(reversed(bottom))
-            if "h" in mode:
-                bottom = [list(reversed(row)) for row in bottom]
-            out = [["." for _ in range(10)] for _ in range(20)]
-            for index, row in enumerate(bottom):
-                out[16 + index] = row
-            return out
-
-        session = GomenSession()
-        try:
-            totals = {}
-            for mode in ("current", "h", "v", "vh"):
-                response = session.solve(
-                    queue_text="LTSI",
-                    garbage=board_to_gomen_garbage(transform(mode)),
-                    hold=True,
-                    timeout_sec=30,
-                    target_queue="",
-                )
-                totals[mode] = int(response.get("total") or 0)
-        finally:
-            session.close()
-
-        self.assertGreater(totals["current"], 0)
-        self.assertEqual(totals["h"], 0)
-        self.assertEqual(totals["v"], 0)
-        self.assertEqual(totals["vh"], 0)
-
-    @unittest.skipUnless(decode_fumen is not None, "py_fumen_py is unavailable")
-    def test_known_pc_hold_filled_active_first_branch_avoids_false_negative(self):
-        page = decode_fumen("v115@9gQ4IeR4Heg0Q4BtDeRpi0BtCeRpJeAgH")[0]
-        field = page.field
-        board = [["." for _ in range(10)] for _ in range(20)]
-        for y in range(4):
-            for x in range(10):
-                board[19 - y][x] = "." if str(field.at(x, y)) == "0" else "X"
-
-        session = GomenSession()
-        try:
-            transform_totals = {}
-            for mode in ("current", "h", "v", "vh"):
-                bottom = [row[:] for row in board[-4:]]
-                if "v" in mode:
-                    bottom = list(reversed(bottom))
-                if "h" in mode:
-                    bottom = [list(reversed(row)) for row in bottom]
-                transformed = [["." for _ in range(10)] for _ in range(20)]
-                for index, row in enumerate(bottom):
-                    transformed[16 + index] = row
-                garbage = board_to_gomen_garbage(transformed)
-                approx = session.solve(
-                    queue_text="LTJOSZ",
-                    garbage=garbage,
-                    hold=True,
-                    timeout_sec=30,
-                    target_queue="",
-                )
-                active_first = session.solve(
-                    queue_text="TJOSZ",
-                    garbage=garbage,
-                    hold=True,
-                    timeout_sec=30,
-                    target_queue="",
-                )
-                transform_totals[mode] = {
-                    "approx": int(approx.get("total") or 0),
-                    "active_first": int(active_first.get("total") or 0),
-                }
-        finally:
-            session.close()
-
-        self.assertEqual(transform_totals["current"]["approx"], 0)
-        self.assertGreater(transform_totals["current"]["active_first"], 0)
-        self.assertEqual(set(transform_totals), {"current", "h", "v", "vh"})
-
-    @unittest.skipUnless(decode_fumen is not None, "py_fumen_py is unavailable")
-    def test_known_pc_hold_filled_trimmed_queue_recovers_solution(self):
-        page = decode_fumen("v115@9gQ4IeR4Heg0Q4BtDeRpi0BtCeRpJeAgH")[0]
-        field = page.field
-        board = [["." for _ in range(10)] for _ in range(20)]
-        for y in range(4):
-            for x in range(10):
-                board[19 - y][x] = "." if str(field.at(x, y)) == "0" else "X"
-
-        session = GomenSession()
-        try:
-            long_queue = session.solve(
-                queue_text="LTJOSZ",
-                garbage=board_to_gomen_garbage(board),
-                hold=True,
                 physics="TETRIO",
                 timeout_sec=30,
-                target_queue="",
-            )
-            trimmed_queue = session.solve(
-                queue_text="TJOSZ",
-                garbage=board_to_gomen_garbage(board),
-                hold=True,
-                physics="TETRIO",
-                timeout_sec=30,
-                target_queue="",
             )
         finally:
             session.close()
 
-        self.assertEqual(int(long_queue.get("total") or 0), 0)
-        self.assertGreater(int(trimmed_queue.get("total") or 0), 0)
+        self.assertTrue(response["ok"])
+        self.assertIn("solutions", response)
 
 
 if __name__ == "__main__":

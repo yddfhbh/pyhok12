@@ -578,10 +578,10 @@ class TetrisScannerApp:
         active_effective = active_guess or "-"
         hold = (result.get("hold") or "").strip().upper() or "-"
         queue_list = [piece for piece in (result.get("queue") or []) if piece]
-        queue_text = "".join(queue_list) or "-"
+        next_text = "".join(queue_list) or "-"
 
-        if solver_result and solver_result.get("queue_text"):
-            see_text = solver_result.get("queue_text")
+        if solver_result and solver_result.get("state_queue"):
+            see_text = str(solver_result.get("state_queue") or "-").strip().upper()
         else:
             try:
                 see_text = make_state_queue(
@@ -596,8 +596,8 @@ class TetrisScannerApp:
             "active_guess": active_guess or "-",
             "active_effective": active_effective,
             "hold": hold,
-            "queue": queue_text,
-            "see": see_text or "-",
+            "next": next_text,
+            "state": see_text or "-",
         }
 
     def draw_output_context_header(self, solver_result=None):
@@ -624,7 +624,7 @@ class TetrisScannerApp:
             text=(
                 f"ACTIVE {context['active_effective']}   "
                 f"HOLD {context['hold']}   "
-                f"QUEUE {context['queue']}"
+                f"NEXT {context['next']}"
             ),
             anchor="w",
             fill="#252525",
@@ -633,10 +633,7 @@ class TetrisScannerApp:
         self.output.create_text(
             x + 10,
             y + 32,
-            text=(
-                f"{'SOLVE' if solver_result else 'SEE'} {context['see']}   "
-                f"CURRENT {context['current']}"
-            ),
+            text=f"STATE {context['state']}",
             anchor="w",
             fill="#7a766d",
             font=("Consolas", 9, "bold"),
@@ -949,7 +946,7 @@ class TetrisScannerApp:
         visible = variants[:6]
         for index, variant in enumerate(visible):
             y = start_y + index * (card_height + gap_y)
-            self.draw_pc_solution_card(start_x, y, card_width, card_height, variant)
+            self.draw_pc_solution_card_exact(start_x, y, card_width, card_height, variant)
 
         bottom = start_y + len(visible) * (card_height + gap_y)
         self.output.config(
@@ -1041,6 +1038,8 @@ class TetrisScannerApp:
         }
 
     def build_pc_solver_variants(self, solver_result, active="", hold=""):
+        return self.build_pc_solver_variants_exact(solver_result, active=active, hold=hold)
+
         variants = []
         solutions = solver_result.get("solutions") or []
         queue_text = str(solver_result.get("queue_text") or "").strip().upper()
@@ -1061,6 +1060,120 @@ class TetrisScannerApp:
                 variant["branch_name"] = str(solution.get("branch_name") or "")
                 variant["matched_group"] = solution.get("matched_group") or ""
                 variants.append(variant)
+
+        return variants
+
+    def draw_pc_solution_card_exact(self, x, y, width, height, variant):
+        title = variant.get("title") or "PC 해법"
+        preview_rows = variant.get("preview_rows") or []
+        next_text = variant.get("next_text") or ""
+        placements_text = variant.get("placements_text") or ""
+        first_move_text = variant.get("first_move_text") or "-"
+        final_hold = variant.get("final_hold") or "-"
+
+        self.output.create_rectangle(
+            x,
+            y,
+            x + width,
+            y + height,
+            fill="#f4f1e8",
+            outline="#dfd9ca",
+        )
+        self.output.create_text(
+            x + 10,
+            y + 12,
+            text=title,
+            anchor="w",
+            fill="#252525",
+            font=("Consolas", 10, "bold"),
+        )
+
+        if preview_rows:
+            self.draw_site_preview_board(preview_rows, x + 10, y + 22, scale=0.55)
+        else:
+            self.output.create_text(
+                x + 10,
+                y + 46,
+                text="배치 미리보기 없음",
+                anchor="w",
+                fill="#8f6f4a",
+                font=("Malgun Gothic", 8, "bold"),
+            )
+
+        self.output.create_text(
+            x + 120,
+            y + 30,
+            text="NEXT",
+            anchor="w",
+            fill="#7a766d",
+            font=("Consolas", 8, "bold"),
+        )
+        self.draw_piece_strip(next_text, x + 120, y + 38, block_size=14, gap=2)
+        self.output.create_text(
+            x + 120,
+            y + 66,
+            text="ORDER",
+            anchor="w",
+            fill="#7a766d",
+            font=("Consolas", 8, "bold"),
+        )
+        self.draw_piece_strip(placements_text, x + 120, y + 74, block_size=12, gap=2)
+        self.output.create_text(
+            x + 120,
+            y + 100,
+            text=first_move_text,
+            anchor="w",
+            fill="#252525",
+            font=("Malgun Gothic", 8, "bold"),
+        )
+        self.output.create_text(
+            x + 120,
+            y + 118,
+            text=f"FINAL HOLD {final_hold}",
+            anchor="w",
+            fill="#252525",
+            font=("Consolas", 8, "bold"),
+        )
+
+    def build_pc_variant_exact(self, index, title, solution, next_text):
+        rows = self.decode_gomen_cells(solution.get("cells", ""))
+        placements = [str(piece or "").strip().upper() for piece in (solution.get("placements") or []) if piece]
+        hold_actions = [bool(value) for value in (solution.get("hold_actions") or [])]
+        if not placements:
+            return None
+
+        first_piece = placements[0]
+        first_hold = bool(hold_actions[0]) if hold_actions else False
+        first_move_text = f"첫 수: HOLD → {first_piece} 사용" if first_hold else f"첫 수: {first_piece} 그대로 사용"
+        return {
+            "title": title if title.startswith(f"{index}. ") else f"{index}. {title}",
+            "preview_rows": rows,
+            "next_text": str(next_text or "").strip().upper(),
+            "placements_text": "".join(placements),
+            "first_move_text": first_move_text,
+            "final_hold": (str(solution.get("final_hold") or "").strip().upper() or "-"),
+            "solution": solution,
+        }
+
+    def build_pc_solver_variants_exact(self, solver_result, active="", hold=""):
+        variants = []
+        solutions = solver_result.get("solutions") or []
+        next_text = "".join(piece for piece in (self.last_result or {}).get("queue", []) if piece)
+        state_queue = str(solver_result.get("state_queue") or "").strip().upper()
+
+        for index, solution in enumerate(solutions[:6], start=1):
+            variant = self.build_pc_variant_exact(
+                index=index,
+                title="PC 해법",
+                solution=solution,
+                next_text=next_text,
+            )
+            if not variant:
+                continue
+            variant["state_queue"] = str(solution.get("state_queue") or state_queue).strip().upper()
+            variant["branch_name"] = str(solution.get("branch_name") or "")
+            variant["matched_group"] = solution.get("matched_group") or ""
+            variants.append(variant)
 
         return variants
 
@@ -1819,6 +1932,12 @@ class TetrisScannerApp:
         shown_total = int(result.get("shown_total") or raw_total or 0)
         solutions = result.get("solutions") or []
         visible_total = len(variants[:6])
+        if not variants and not solutions and result.get("display_message"):
+            message = str(result.get("display_message"))
+            self.pc_solver_status_var.set(message)
+            self.print_message(message)
+            self.status_label.config(text="PC 솔버 유효 해법 없음")
+            return
         print(
             f"[PC SOLVER] success raw_total={raw_total} "
             f"shown_total={shown_total} solutions={len(solutions)} variants={len(variants)}"

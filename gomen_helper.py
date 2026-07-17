@@ -227,6 +227,44 @@ class GomenSession:
 
             return response
 
+    def solve_state(
+        self,
+        *,
+        current,
+        initial_hold="",
+        next_queue="",
+        garbage,
+        can_hold=True,
+        physics="TETRIO",
+        limit=6,
+        timeout_sec=20,
+    ):
+        with self.lock:
+            self.ensure_started(timeout_sec=timeout_sec)
+
+            if self.proc is None or self.proc.poll() is not None or self.proc.stdin is None:
+                raise GomenError("gomen 세션이 종료되었습니다.")
+
+            request = {
+                "mode": "state",
+                "current": clean_piece_text(current)[:1],
+                "initial_hold": clean_piece_text(initial_hold)[:1],
+                "next_queue": clean_piece_text(next_queue),
+                "garbage": str(int(garbage)),
+                "can_hold": bool(can_hold),
+                "physics": physics,
+                "limit": int(limit),
+            }
+
+            self.proc.stdin.write(json.dumps(request, ensure_ascii=True) + "\n")
+            self.proc.stdin.flush()
+
+            response = self._read_json(timeout_sec=timeout_sec)
+            if not response.get("ok"):
+                raise GomenError(response.get("error") or "gomen 계산 실패")
+
+            return response
+
     def close(self):
         with self.lock:
             self.closing = True
@@ -407,7 +445,7 @@ def build_gomen_debug_payload(
     hold,
     queue,
     state_queue,
-    queue_text,
+    next_queue,
     garbage,
     branch_name,
     solver_context,
@@ -422,8 +460,8 @@ def build_gomen_debug_payload(
         "hold": clean_piece_text(hold),
         "raw_queue": "".join(piece for piece in (queue or []) if piece in VALID_PIECES),
         "state_queue": str(state_queue or ""),
-        "queue_text": str(queue_text or ""),
-        "queue_length": len(str(queue_text or "")),
+        "next_queue": str(next_queue or ""),
+        "next_length": len(str(next_queue or "")),
         "fixed_cells": int(solver_context["fixed_cells"]),
         "remaining_cells": int(solver_context["remaining_cells"]),
         "placements_needed": int(solver_context["placements_needed"]),
@@ -446,63 +484,49 @@ def log_gomen_request(debug_payload):
     print(f"[GOMEN REQUEST] hold={debug_payload['hold'] or '-'}")
     print(f"[GOMEN REQUEST] raw_queue={debug_payload['raw_queue']}")
     print(f"[GOMEN REQUEST] state_queue={debug_payload['state_queue'] or '-'}")
-    print(f"[GOMEN REQUEST] queue_text={debug_payload['queue_text'] or '-'}")
-    print(f"[GOMEN REQUEST] queue_length={debug_payload['queue_length']}")
+    print(f"[GOMEN REQUEST] next_queue={debug_payload['next_queue'] or '-'}")
+    print(f"[GOMEN REQUEST] next_length={debug_payload['next_length']}")
     print(f"[GOMEN REQUEST] use_hold={'true' if debug_payload['use_hold'] else 'false'}")
-
-
-def _build_branch_queue_text(base_queue_text, solver_piece_limit):
-    queue_text = clean_piece_text(base_queue_text)
-    return queue_text[:solver_piece_limit], len(queue_text)
 
 
 def build_gomen_branches(active, hold, queue, manual_see="", solver_piece_limit=None):
     state_queue = make_state_queue(active, queue, manual_see=manual_see)
-    hold_piece = clean_piece_text(hold)
-    branch_limit = int(solver_piece_limit) if solver_piece_limit is not None else len(state_queue)
-    active_queue_text, active_available = _build_branch_queue_text(state_queue, branch_limit)
-    branches = [
+    current_piece = clean_piece_text(state_queue[:1])
+    hold_piece = clean_piece_text(hold)[:1]
+    next_source = clean_piece_text(state_queue[1:])
+    required_total = int(solver_piece_limit) if solver_piece_limit is not None else len(state_queue)
+    required_next = max(0, required_total - 1 - (1 if hold_piece else 0))
+    next_queue = next_source[:required_next]
+    available_total = 1 + len(next_source) + (1 if hold_piece else 0)
+
+    return state_queue, [
         {
-            "name": "active-first",
-            "queue_text": active_queue_text,
-            "target_queue": active_queue_text,
-            "hold": True,
-            "use_hold": True,
-            "available_length": active_available,
-            "required_length": branch_limit,
+            "name": "exact-state",
+            "current": current_piece,
+            "initial_hold": hold_piece,
+            "next_queue": next_queue,
+            "can_hold": True,
+            "available_total": available_total,
+            "required_total": required_total,
+            "required_next": required_next,
         }
     ]
-    if hold_piece and not clean_piece_text(manual_see):
-        hold_queue_text, hold_available = _build_branch_queue_text(hold_piece[0] + state_queue, branch_limit)
-        branches.append(
-            {
-                "name": "hold-first",
-                "queue_text": hold_queue_text,
-                "target_queue": hold_queue_text,
-                "hold": True,
-                "use_hold": True,
-                "available_length": hold_available,
-                "required_length": branch_limit,
-            }
-        )
-    return state_queue, branches
 
 
 def _run_gomen_branch(session, branch, garbage, *, timeout_sec, physics, limit):
-    result = session.solve(
-        queue_text=branch["queue_text"],
+    result = session.solve_state(
+        current=branch["current"],
+        initial_hold=branch.get("initial_hold", ""),
+        next_queue=branch.get("next_queue", ""),
         garbage=garbage,
-        hold=branch.get("hold", True),
+        can_hold=branch.get("can_hold", True),
         physics=physics,
         limit=limit,
         timeout_sec=timeout_sec,
-        target_queue=branch.get("target_queue", ""),
     )
     result["branch_name"] = branch["name"]
     result["engine_zero"] = int(result.get("total") or 0) == 0
-    result["exact_queue_filter_miss"] = (
-        int(result.get("total") or 0) > 0 and not bool(result.get("exact_match_used"))
-    )
+    result["exact_queue_filter_miss"] = False
     return result
 
 
@@ -518,58 +542,144 @@ def _log_gomen_branch_response(result):
 
 def _solution_cache_key(solution):
     cells = str(solution.get("cells") or "")
-    if cells:
-        return ("cells", cells)
+    placements = tuple(_normalize_piece_list(solution.get("placements")))
+    hold_actions = tuple(_normalize_hold_actions(solution.get("hold_actions"), len(placements)))
+    final_hold = clean_piece_text(solution.get("final_hold"))[:1]
+    consumed_next_count = int(solution.get("consumed_next_count") or 0)
+    if cells and placements:
+        return ("exact-state", cells, placements, hold_actions, final_hold, consumed_next_count)
     return ("json", json.dumps(solution, ensure_ascii=True, sort_keys=True))
 
 
 def _annotate_branch_solutions(result):
-    queue_text = str(result.get("queue_text") or "").strip().upper()
     branch_name = str(result.get("branch_name") or "")
     state_queue = str(result.get("state_queue") or "")
     for solution in result.get("solutions") or []:
-        solution.setdefault("queue_text", queue_text)
         solution.setdefault("branch_name", branch_name)
         solution.setdefault("state_queue", state_queue)
     return result
 
 
-def _merge_branch_results(success_results, state_queue):
-    merged_solutions = []
-    seen_solution_keys = set()
-    for result in success_results:
-        _annotate_branch_solutions(result)
-        for solution in result.get("solutions") or []:
-            key = _solution_cache_key(solution)
-            if key in seen_solution_keys:
-                continue
-            seen_solution_keys.add(key)
-            merged_solutions.append(copy.deepcopy(solution))
+def _normalize_piece_list(value):
+    if isinstance(value, str):
+        return [piece for piece in clean_piece_text(value)]
 
-    first_nonzero = next(
-        (item for item in success_results if int(item.get("total") or 0) > 0),
-        success_results[0],
-    )
-    merged = copy.deepcopy(first_nonzero)
-    merged["branch_name"] = (
-        first_nonzero.get("branch_name")
-        if len(success_results) == 1
-        else "+".join(result.get("branch_name") or "" for result in success_results)
-    )
-    merged["total"] = sum(int(result.get("total") or 0) for result in success_results)
-    merged["matched_total"] = sum(
-        1 for solution in merged_solutions if str(solution.get("matched_group") or "").strip()
-    )
-    merged["shown_total"] = len(merged_solutions)
-    merged["solutions"] = merged_solutions
-    merged["exact_match_used"] = any(bool(result.get("exact_match_used")) for result in success_results)
-    merged["engine_zero"] = all(int(result.get("total") or 0) == 0 for result in success_results)
-    merged["exact_queue_filter_miss"] = any(
-        bool(result.get("exact_queue_filter_miss")) for result in success_results
-    )
-    merged["queue_text"] = str(first_nonzero.get("queue_text") or "")
-    merged["state_queue"] = state_queue
-    return merged
+    pieces = []
+    for item in value or []:
+        piece = clean_piece_text(item)[:1]
+        if piece:
+            pieces.append(piece)
+    return pieces
+
+
+def _normalize_hold_actions(value, expected_length):
+    actions = []
+    for item in value or []:
+        actions.append(bool(item))
+    if len(actions) < expected_length:
+        actions.extend([False] * (expected_length - len(actions)))
+    return actions[:expected_length]
+
+
+def _serialize_solution_for_log(solution):
+    try:
+        return json.dumps(solution, ensure_ascii=True, sort_keys=True)
+    except Exception:
+        return str(solution)
+
+
+def _log_invalid_solution(reason, solution, current, hold, next_queue):
+    print(f"[PC SOLVER FILTER] reason={reason}")
+    print(f"[PC SOLVER FILTER] solution={_serialize_solution_for_log(solution)}")
+    print(f"[PC SOLVER FILTER] current={current or '-'}")
+    print(f"[PC SOLVER FILTER] hold={hold or '-'}")
+    print(f"[PC SOLVER FILTER] next={next_queue or '-'}")
+
+
+def _validate_solution_sequence(solution, current, hold, next_queue):
+    placements = _normalize_piece_list(solution.get("placements"))
+    hold_actions = _normalize_hold_actions(solution.get("hold_actions"), len(placements))
+    active_piece = clean_piece_text(current)[:1]
+    hold_piece = clean_piece_text(hold)[:1]
+    next_pieces = list(clean_piece_text(next_queue))
+    next_index = 0
+
+    if not active_piece:
+        return False, "missing_current", None
+    if not placements:
+        return False, "missing_placements", None
+
+    raw_initial_current = solution.get("initial_current")
+    raw_initial_hold = solution.get("initial_hold")
+    solution_current = clean_piece_text(raw_initial_current)[:1]
+    solution_hold = clean_piece_text(raw_initial_hold)[:1]
+    if raw_initial_current not in (None, "") and solution_current != active_piece:
+        return False, "initial_current_mismatch", None
+    if raw_initial_hold not in (None, "") and solution_hold != hold_piece:
+        return False, "initial_hold_mismatch", None
+
+    for step_index, (placement_piece, used_hold) in enumerate(zip(placements, hold_actions)):
+        current_piece = active_piece
+        if used_hold:
+            if hold_piece:
+                current_piece, hold_piece = hold_piece, current_piece
+            else:
+                if next_index >= len(next_pieces):
+                    return False, "invalid_hold_transition", None
+                hold_piece = current_piece
+                current_piece = next_pieces[next_index]
+                next_index += 1
+
+        if placement_piece != current_piece:
+            if not used_hold and placement_piece in next_pieces[next_index:]:
+                return False, "invalid_next_order", None
+            return False, "invalid_hold_transition", None
+
+        if step_index < len(placements) - 1:
+            if next_index >= len(next_pieces):
+                return False, "invalid_next_order", None
+            active_piece = next_pieces[next_index]
+            next_index += 1
+
+    final_hold = clean_piece_text(solution.get("final_hold"))[:1]
+    if final_hold != hold_piece:
+        return False, "final_hold_mismatch", None
+
+    consumed_next_count = int(solution.get("consumed_next_count") or 0)
+    if consumed_next_count != next_index:
+        return False, "consumed_next_count_mismatch", None
+
+    normalized = copy.deepcopy(solution)
+    normalized["placements"] = placements
+    normalized["hold_actions"] = hold_actions
+    normalized["initial_current"] = active_piece = clean_piece_text(current)[:1]
+    normalized["initial_hold"] = clean_piece_text(hold)[:1]
+    normalized["initial_next"] = clean_piece_text(next_queue)
+    normalized["final_hold"] = hold_piece
+    normalized["consumed_next_count"] = next_index
+    normalized["physics"] = str(solution.get("physics") or "")
+    return True, "", normalized
+
+
+def _filter_valid_solutions(result, *, current, hold, next_queue):
+    filtered = []
+    seen_solution_keys = set()
+    for solution in result.get("solutions") or []:
+        is_valid, reason, normalized = _validate_solution_sequence(
+            solution,
+            current=current,
+            hold=hold,
+            next_queue=next_queue,
+        )
+        if not is_valid:
+            _log_invalid_solution(reason, solution, current, hold, next_queue)
+            continue
+        key = _solution_cache_key(normalized)
+        if key in seen_solution_keys:
+            continue
+        seen_solution_keys.add(key)
+        filtered.append(normalized)
+    return filtered
 
 
 def _build_branch_cache_key(
@@ -620,7 +730,104 @@ def warm_gomen_session(timeout_sec=20):
     session.ensure_started(timeout_sec=timeout_sec)
 
 
+def _run_gomen_solver_exact(board, active, hold, queue, manual_see="", limit=6, physics="TETRIO", timeout_sec=20):
+    garbage = board_to_gomen_garbage(board)
+    solver_context = calculate_solver_piece_limit(board)
+    state_queue, branches = build_gomen_branches(
+        active,
+        hold,
+        queue,
+        manual_see=manual_see,
+        solver_piece_limit=solver_context["solver_piece_limit"],
+    )
+    hold_text = clean_piece_text(hold)[:1]
+    session = get_gomen_session()
+    branch = branches[0]
+    available_total = int(branch.get("available_total") or 0)
+    required_total = int(branch.get("required_total") or 0)
+    if available_total < required_total:
+        raise GomenError(f"PC SOLVER: NEXT 큐 부족\n필요={required_total}, 확보={available_total}")
+
+    debug_payload = build_gomen_debug_payload(
+        board,
+        active,
+        hold,
+        queue,
+        state_queue,
+        branch["next_queue"],
+        garbage,
+        branch["name"],
+        solver_context,
+        branch.get("can_hold", True),
+    )
+    log_gomen_request(debug_payload)
+    cache_key = _build_branch_cache_key(
+        garbage=garbage,
+        branch_name=branch["name"],
+        queue_text=branch["next_queue"],
+        placements_needed=solver_context["placements_needed"],
+        solver_piece_limit=solver_context["solver_piece_limit"],
+        physics=physics,
+        use_hold=branch.get("can_hold", True),
+        current=branch["current"],
+        hold=hold_text,
+    )
+    cached_branch = _RESULT_CACHE.get(cache_key)
+    if cached_branch is not None:
+        result = copy.deepcopy(cached_branch)
+    else:
+        result = _run_gomen_branch(
+            session,
+            branch,
+            garbage,
+            timeout_sec=timeout_sec,
+            physics=physics,
+            limit=limit,
+        )
+        _RESULT_CACHE[cache_key] = copy.deepcopy(result)
+
+    result["branch_index"] = 0
+    result["debug_request"] = debug_payload
+    result["state_queue"] = state_queue
+    result["next_queue"] = branch["next_queue"]
+    result["initial_current"] = branch["current"]
+    result["initial_hold"] = hold_text
+
+    filtered_solutions = _filter_valid_solutions(
+        result,
+        current=branch["current"],
+        hold=hold_text,
+        next_queue=branch["next_queue"],
+    )
+    result["solutions"] = filtered_solutions[: int(limit)]
+    result["shown_total"] = len(result["solutions"])
+    result["matched_total"] = len(result["solutions"])
+    result["exact_match_used"] = True
+    result["engine_zero"] = int(result.get("total") or 0) == 0
+    result["exact_queue_filter_miss"] = False
+    if int(result.get("total") or 0) > 0 and not result["solutions"]:
+        result["no_valid_sequence"] = True
+        result["display_message"] = "PC SOLVER: 유효한 실제 게임 순서 해법 없음"
+
+    _annotate_branch_solutions(result)
+    _log_gomen_branch_response(result)
+    result["branch_results"] = [copy.deepcopy(result)]
+    result["garbage"] = str(garbage)
+    return result
+
+
 def run_gomen_solver(board, active, hold, queue, manual_see="", limit=6, physics="TETRIO", timeout_sec=20):
+    return _run_gomen_solver_exact(
+        board,
+        active,
+        hold,
+        queue,
+        manual_see=manual_see,
+        limit=limit,
+        physics=physics,
+        timeout_sec=timeout_sec,
+    )
+
     garbage = board_to_gomen_garbage(board)
     solver_context = calculate_solver_piece_limit(board)
     state_queue, branches = build_gomen_branches(
