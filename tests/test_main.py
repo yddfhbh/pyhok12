@@ -645,8 +645,53 @@ class MainUiTests(unittest.TestCase):
     def test_format_setup_success_rate_text_handles_100_and_invalid_values(self):
         self.assertEqual(self.app.format_setup_success_rate_text("100.00%"), "성공 확률 100%")
         self.assertEqual(self.app.format_setup_success_rate_text("100%"), "성공 확률 100%")
+        self.assertEqual(self.app.format_setup_success_rate_text(0), "성공 확률 0.00%")
         self.assertEqual(self.app.format_setup_success_rate_text(""), "성공 확률 계산 불가")
         self.assertEqual(self.app.format_setup_success_rate_text("N/A"), "성공 확률 계산 불가")
+
+    def test_render_setup_groups_filters_unusable_success_rates_and_renumbers_cards(self):
+        def variant(title, setup_id, sequence, percent):
+            return {
+                "title": title,
+                "queue_text": sequence,
+                "display_lookup_text": sequence,
+                "setup": {"id": setup_id, "match": sequence, "percent": percent},
+            }
+
+        variants = [
+            variant("1. ACTIVE", "ID", "I", None),
+            variant("2. HOLD", "ZERO", "T", "0%"),
+            variant("3. ACTIVE", "NAN", "L", "NaN"),
+            variant("4. HOLD", "VALID", "S", "25.5%"),
+            variant("5. ACTIVE", "OUTSIDE", "Z", "101%"),
+        ]
+
+        with mock.patch("builtins.print") as print_mock:
+            self.app.render_setup_groups(variants)
+
+        texts = self.get_canvas_texts()
+        self.assertIn("1. HOLD", texts)
+        self.assertIn("2. HOLD", texts)
+        self.assertNotIn("1. ACTIVE", texts)
+        self.assertNotIn("3. ACTIVE", texts)
+        self.assertNotIn("4. HOLD", texts)
+        self.assertNotIn("5. ACTIVE", texts)
+        self.assertIn("성공 확률 0.00%", texts)
+        self.assertIn("성공 확률 25.50%", texts)
+        self.assertEqual(variants[0]["setup"]["percent"], None)
+        self.assertEqual(variants[3]["title"], "4. HOLD")
+        printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
+        self.assertIn("[SETUP FILTER] reason=missing_success_rate name=ID sequence=I", printed)
+        self.assertIn("name=NAN sequence=L", printed)
+        self.assertIn("name=OUTSIDE sequence=Z", printed)
+
+    def test_render_setup_groups_shows_empty_state_when_all_success_rates_are_unusable(self):
+        variants = [{"title": "1. ACTIVE", "queue_text": "I", "setup": {"id": "ID", "percent": ""}}]
+
+        self.app.render_setup_groups(variants)
+
+        self.assertEqual(self.app.output_hint_var.get(), "확률을 계산할 수 있는 셋업이 없습니다.")
+        self.assertIn("확률을 계산할 수 있는 셋업이 없습니다.", self.get_canvas_texts())
 
     def test_build_setup_variants_uses_current_on_empty_locked_board(self):
         result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])

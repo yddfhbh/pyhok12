@@ -1,4 +1,5 @@
 import ctypes
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -1453,6 +1454,11 @@ class TetrisScannerApp:
         return variants
 
     def render_setup_groups(self, variants):
+        visible_candidates = self.filter_setup_variants_for_rendering(variants)
+        if not visible_candidates:
+            self.render_setup_empty_state("확률을 계산할 수 있는 셋업이 없습니다.")
+            return
+
         self.output.delete("all")
         self.current_output_mode = "setup"
 
@@ -1462,7 +1468,11 @@ class TetrisScannerApp:
         gap_y = 12
         start_x = 8
         start_y = self.draw_output_context_header()
-        visible = variants[:6]
+        visible = []
+        for index, variant in enumerate(visible_candidates[:6], start=1):
+            display_variant = dict(variant)
+            display_variant["title"] = self.format_setup_display_title(variant.get("title"), index)
+            visible.append(display_variant)
 
         for index, variant in enumerate(visible):
             col = index % 2
@@ -1481,6 +1491,29 @@ class TetrisScannerApp:
                 for variant in visible
             )
         )
+
+    def filter_setup_variants_for_rendering(self, variants):
+        visible = []
+        for variant in variants or []:
+            setup = variant.get("setup") or {}
+            if self.parse_setup_success_rate(setup.get("percent")) is None:
+                sequence = setup.get("match") or variant.get("display_lookup_text") or variant.get("lookup_queue_text") or variant.get("queue_text") or ""
+                print(
+                    "[SETUP FILTER]"
+                    " reason=missing_success_rate"
+                    f" name={setup.get('id') or '-'}"
+                    f" sequence={sequence}"
+                )
+                continue
+            visible.append(variant)
+        return visible
+
+    def format_setup_display_title(self, title, index):
+        title = str(title or "").strip()
+        if ". " in title:
+            _, suffix = title.split(". ", 1)
+            return f"{index}. {suffix}"
+        return f"{index}. {title}" if title else f"{index}."
 
     def draw_setup_card(self, x, y, width, height, variant):
         setup = variant["setup"]
@@ -1558,21 +1591,32 @@ class TetrisScannerApp:
         )
 
     def format_setup_success_rate_text(self, percent_text):
-        normalized = str(percent_text or "").strip()
-        if not normalized:
+        value = self.parse_setup_success_rate(percent_text)
+        if value is None:
             return "성공 확률 계산 불가"
 
+        if abs(value - 100.0) < 0.005:
+            return "성공 확률 100%"
+        return f"성공 확률 {value:.2f}%"
+
+    def parse_setup_success_rate(self, percent_text):
+        if percent_text is None:
+            return None
+
+        normalized = str(percent_text).strip()
+        if not normalized:
+            return None
         if normalized.endswith("%"):
             normalized = normalized[:-1].strip()
 
         try:
             value = float(normalized)
         except (TypeError, ValueError):
-            return "성공 확률 계산 불가"
+            return None
 
-        if abs(value - 100.0) < 0.005:
-            return "성공 확률 100%"
-        return f"성공 확률 {value:.2f}%"
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            return None
+        return value
 
     def build_setup_variants(self, result):
         if find_setup_for_pc is None:
