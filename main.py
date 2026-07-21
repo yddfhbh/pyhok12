@@ -41,6 +41,8 @@ VK_DELETE = 0x2E
 VK_END = 0x23
 BROWSER_READY_TIMEOUT_SEC = 10.0
 BROWSER_READY_POLL_INTERVAL_SEC = 0.25
+CDP_ACTION_PORT_TIMEOUT_SEC = 1.0
+CDP_ACTION_SNAPSHOT_TIMEOUT_SEC = 8.0
 BROWSER_LAUNCH_ENV_KEYS = ("TETRIO_BROWSER_PATH", "BROWSER_PATH", "CHROME_PATH")
 
 
@@ -220,6 +222,8 @@ class TetrisScannerApp:
         self.is_pc_solver_warming = False
         self.pc_solver_warm_ready = False
         self.browser_launch_in_progress = False
+        self.browser_action_in_progress = False
+        self.browser_action_name = ""
         self.hotkey_pressed = {
             VK_DELETE: False,
             VK_END: False,
@@ -254,7 +258,7 @@ class TetrisScannerApp:
             width=15,
             height=2,
             font=("Malgun Gothic", 11, "bold"),
-            command=self.scan_for_pc_solve,
+            command=self.on_pc_solver_requested,
         )
         self.pc_scan_button.grid(row=0, column=0, padx=5)
 
@@ -264,7 +268,7 @@ class TetrisScannerApp:
             width=15,
             height=2,
             font=("Malgun Gothic", 11, "bold"),
-            command=self.scan_for_setup_finder,
+            command=self.on_setup_requested,
         )
         self.setup_scan_button.grid(row=0, column=1, padx=5)
 
@@ -411,11 +415,11 @@ class TetrisScannerApp:
         self.root.bind("<End>", self.on_local_end_hotkey, add="+")
 
     def on_local_delete_hotkey(self, _event=None):
-        self.scan_for_pc_solve(show_popup=False)
+        self.on_pc_solver_requested(show_popup=False)
         return "break"
 
     def on_local_end_hotkey(self, _event=None):
-        self.scan_for_setup_finder(show_popup=False)
+        self.on_setup_requested(show_popup=False)
         return "break"
 
     def register_global_hotkeys(self):
@@ -450,10 +454,10 @@ class TetrisScannerApp:
 
     def handle_global_hotkey(self, hotkey_id):
         if hotkey_id == VK_DELETE:
-            self.scan_for_pc_solve(show_popup=False)
+            self.on_pc_solver_requested(show_popup=False)
             return
         if hotkey_id == VK_END:
-            self.scan_for_setup_finder(show_popup=False)
+            self.on_setup_requested(show_popup=False)
 
     def unregister_global_hotkeys(self):
         for virtual_key in self.hotkey_pressed:
@@ -767,20 +771,40 @@ class TetrisScannerApp:
         self.setup_scan_button.config(state=state)
 
     def update_action_buttons_state(self):
-        scan_state = "disabled" if self.is_scanning or self.is_pc_solving or self.browser_launch_in_progress else "normal"
+        scan_state = (
+            "disabled"
+            if self.is_scanning
+            or self.is_pc_solving
+            or self.browser_launch_in_progress
+            or self.browser_action_in_progress
+            else "normal"
+        )
         browser_state = "disabled" if self.browser_launch_in_progress or self.is_closing else "normal"
         self.set_scan_buttons_state(scan_state)
         self.browser_open_button.config(state=browser_state)
 
+    def _log_cdp_action(self, message):
+        print(f"[CDP ACTION] {message}")
+
+    def on_pc_solver_requested(self, show_popup=True):
+        self.run_action_with_browser_source(
+            "pc-solver",
+            self.execute_pc_solver,
+            show_popup=show_popup,
+        )
+
+    def on_setup_requested(self, show_popup=True):
+        self.run_action_with_browser_source(
+            "setup-solver",
+            self.execute_setup_solver,
+            show_popup=show_popup,
+        )
+
     def scan_for_pc_solve(self, show_popup=True):
-        if not self.ensure_browser_source_for_action(show_popup=show_popup):
-            return
-        self.scan(scan_target="pc_solve", show_popup=show_popup)
+        self.on_pc_solver_requested(show_popup=show_popup)
 
     def scan_for_setup_finder(self, show_popup=True):
-        if not self.ensure_browser_source_for_action(show_popup=show_popup):
-            return
-        self.scan(scan_target="setup", show_popup=show_popup)
+        self.on_setup_requested(show_popup=show_popup)
 
     def schedule_auto_scan(self, delay_ms=None):
         if not self.auto_scan_enabled:
@@ -794,7 +818,7 @@ class TetrisScannerApp:
 
     def auto_scan_tick(self):
         self.auto_scan_job = None
-        self.scan_for_pc_solve(show_popup=False)
+        self.on_pc_solver_requested(show_popup=False)
 
     def on_close(self):
         self.is_closing = True
@@ -841,16 +865,15 @@ class TetrisScannerApp:
         }
 
     def _ensure_browser_reader_started(self):
-        if self.state_source.is_running():
-            return
-        self.state_source.start()
+        self.state_source.ensure_connected(timeout_sec=BROWSER_READY_TIMEOUT_SEC)
 
     def ensure_browser_source_for_action(self, show_popup=True):
         port = get_cdp_port(self.config)
-        if not is_cdp_endpoint_available(port):
+        if not is_cdp_endpoint_available(port, timeout_sec=CDP_ACTION_PORT_TIMEOUT_SEC):
             message = "브라우저 열기를 먼저 눌러주세요."
             self.status_label.config(text=message)
             self._set_browser_detail(message)
+            self.state_source.mark_browser_closed(message)
             return False
 
         try:
@@ -862,6 +885,99 @@ class TetrisScannerApp:
                 messagebox.showerror("브라우저 연결 오류", str(exc))
             return False
         return True
+
+    def run_action_with_browser_source(self, action_name, callback, show_popup=True):
+        if self.is_closing or self.browser_action_in_progress or self.is_scanning or self.is_pc_solving:
+            return
+
+        self.browser_action_in_progress = True
+        self.browser_action_name = action_name
+        self.update_action_buttons_state()
+        self.status_label.config(text="브라우저 상태 연결 중...")
+        self._set_browser_detail("브라우저 상태 연결 중...")
+        action_started_at_ms = int(time.time() * 1000)
+
+        worker = threading.Thread(
+            target=self._run_action_with_browser_source_worker,
+            args=(action_name, callback, show_popup, action_started_at_ms),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_action_with_browser_source_worker(
+        self,
+        action_name,
+        callback,
+        show_popup,
+        action_started_at_ms,
+    ):
+        port = get_cdp_port(self.config)
+        cdp_available = is_cdp_endpoint_available(
+            port,
+            timeout_sec=CDP_ACTION_PORT_TIMEOUT_SEC,
+        )
+        self._log_cdp_action(f"action={action_name}")
+        self._log_cdp_action(f"cdp_available={str(cdp_available).lower()}")
+        if not cdp_available:
+            self.state_source.mark_browser_closed("브라우저 열기를 먼저 눌러주세요.")
+            self._post_to_ui(
+                self._on_browser_action_browser_missing,
+                show_popup,
+            )
+            return
+
+        self._log_cdp_action(
+            f"reader_alive={str(self.state_source.is_reader_alive()).lower()}"
+        )
+        try:
+            result = self.state_source.prepare_result_for_action(
+                action_name,
+                action_started_at_ms=action_started_at_ms,
+                timeout_sec=CDP_ACTION_SNAPSHOT_TIMEOUT_SEC,
+            )
+            self._post_to_ui(
+                self._on_browser_action_success,
+                callback,
+                result,
+            )
+        except Exception as exc:
+            self._post_to_ui(
+                self._on_browser_action_error,
+                str(exc),
+                show_popup,
+            )
+
+    def _finish_browser_action(self):
+        self.browser_action_in_progress = False
+        self.browser_action_name = ""
+        if not self.is_closing:
+            self.update_action_buttons_state()
+
+    def _on_browser_action_browser_missing(self, show_popup):
+        self._finish_browser_action()
+        message = "브라우저 열기를 먼저 눌러주세요."
+        self.status_label.config(text=message)
+        self._set_browser_detail(message)
+        if show_popup:
+            messagebox.showwarning("브라우저 연결", message)
+
+    def _on_browser_action_success(self, callback, result):
+        self._finish_browser_action()
+        self.status_label.config(text="브라우저 연결됨")
+        self._set_browser_detail("브라우저 연결됨")
+        callback(result)
+
+    def _on_browser_action_error(self, error_text, show_popup):
+        self._finish_browser_action()
+        status_text = (
+            "TETR.IO 게임 상태를 읽지 못했습니다."
+            if error_text == "TETR.IO 게임 상태를 읽지 못했습니다."
+            else "브라우저 상태 연결에 실패했습니다."
+        )
+        self.status_label.config(text=status_text)
+        self._set_browser_detail(error_text)
+        if show_popup:
+            messagebox.showerror("브라우저 상태 오류", error_text)
 
     def open_tetrio_browser(self):
         if self.is_closing:
@@ -979,6 +1095,12 @@ class TetrisScannerApp:
         self.pc_solver_status_var.set("PC SOLVER: 예열 중")
         worker = threading.Thread(target=self._pc_solver_warmup_worker, daemon=True)
         worker.start()
+
+    def execute_pc_solver(self, result):
+        self._on_scan_success(result, "pc_solve")
+
+    def execute_setup_solver(self, result):
+        self._on_scan_success(result, "setup")
 
     def scan(self, scan_target="setup", show_popup=True):
         if self.is_scanning or self.is_closing:

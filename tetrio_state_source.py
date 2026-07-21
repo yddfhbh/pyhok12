@@ -4,7 +4,7 @@ import queue
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app_paths import get_resource_path, get_runtime_data_dir, resolve_node_executable, resolve_runtime_file
@@ -71,6 +71,8 @@ class NormalizedSnapshot:
     age_ms: int
     board_width: int
     board_height: int
+    received_at: int = 0
+    connection_generation: int = 0
 
 
 def deep_merge(base, override):
@@ -431,6 +433,16 @@ class TetrioStateSource:
         self._helper_started_at_ms = 0
         self._closing_pids = set()
         self._last_pipe_warning = ""
+        self.connection_generation = 0
+        self.last_snapshot_generation = 0
+        self.last_snapshot_received_at_ms = 0
+        self.last_snapshot_captured_at_ms = 0
+        self.stdout_closed_at_ms = 0
+        self.reader_exited_at_ms = 0
+        self.helper_exit_code = None
+
+    def _log(self, message):
+        print(message)
 
     def _reset_sequence_guard(self) -> None:
         self._last_session_id = None
@@ -448,6 +460,88 @@ class TetrioStateSource:
     def _is_process_running(self):
         proc = self.proc
         return proc is not None and proc.poll() is None
+
+    def _is_reader_thread_alive_locked(self):
+        thread = self.reader_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def is_process_alive(self):
+        with self.lock:
+            return self._is_process_running()
+
+    def is_reader_alive(self):
+        with self.lock:
+            return self._is_reader_thread_alive_locked() and self.stdout_closed_at_ms <= 0
+
+    def has_stdout_reader_closed(self):
+        with self.lock:
+            return self.stdout_closed_at_ms > 0
+
+    def _snapshot_matches_action_locked(
+        self,
+        snapshot,
+        *,
+        max_age_sec=1.0,
+        min_received_at_ms=None,
+        generation=None,
+    ):
+        if snapshot is None:
+            return False
+        if generation is not None and snapshot.connection_generation != int(generation):
+            return False
+        if min_received_at_ms is not None and snapshot.received_at < int(min_received_at_ms):
+            return False
+        if not snapshot.ready or not snapshot.playing:
+            return False
+        if not snapshot.current or len(snapshot.queue or []) < int(self.config["tetrio_cdp"]["required_queue_length"]):
+            return False
+        age_ms = max(0, int(time.time() * 1000) - int(snapshot.captured_at))
+        return age_ms <= int(max(100, float(max_age_sec) * 1000))
+
+    def has_fresh_snapshot(
+        self,
+        *,
+        max_age_sec=1.0,
+        min_received_at_ms=None,
+        generation=None,
+    ):
+        snapshot = self.get_latest_valid_snapshot(allow_start=False)
+        with self.lock:
+            return self._snapshot_matches_action_locked(
+                snapshot,
+                max_age_sec=max_age_sec,
+                min_received_at_ms=min_received_at_ms,
+                generation=generation,
+            )
+
+    def is_ready_for_action(
+        self,
+        *,
+        max_age_sec=1.0,
+        min_received_at_ms=None,
+        generation=None,
+    ):
+        with self.lock:
+            if not self._is_process_running():
+                return False
+            if not self.browser_connected or not self.last_ready:
+                return False
+            if not self._is_reader_thread_alive_locked():
+                return False
+            if self.stdout_closed_at_ms > 0:
+                return False
+        return self.has_fresh_snapshot(
+            max_age_sec=max_age_sec,
+            min_received_at_ms=min_received_at_ms,
+            generation=generation,
+        )
+
+    def _calculate_idle_seconds_locked(self):
+        now_ms = int(time.time() * 1000)
+        reference_ms = self.last_snapshot_received_at_ms or self.last_snapshot_captured_at_ms or self._helper_started_at_ms
+        if reference_ms <= 0:
+            return 0.0
+        return max(0.0, (now_ms - reference_ms) / 1000.0)
 
     def _get_max_restart_delay_sec(self):
         raw_value = self.config.get("tetrio_cdp", {}).get("max_restart_delay_sec", 5)
@@ -515,12 +609,19 @@ class TetrioStateSource:
                 creationflags=creationflags,
                 env=env,
             )
+            self.connection_generation += 1
+            self.helper_exit_code = None
+            self.stdout_closed_at_ms = 0
+            self.reader_exited_at_ms = 0
             self._helper_started_at_ms = int(time.time() * 1000)
             self._last_snapshot_seen = False
             self.last_reason = "Waiting for game state"
             self.last_ready = False
             self.browser_connected = False
             self.last_valid_snapshot = None
+            self.last_snapshot_generation = 0
+            self.last_snapshot_received_at_ms = 0
+            self.last_snapshot_captured_at_ms = 0
             self._reset_sequence_guard()
             self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
             self.reader_thread.start()
@@ -549,19 +650,29 @@ class TetrioStateSource:
                 except Exception:
                     pass
 
-        if not restart:
+        with self.lock:
             self.browser_connected = False
             self.last_ready = False
-            if self.last_reason == "Browser connected":
+            self.last_valid_snapshot = None
+            self.last_snapshot_generation = 0
+            self.last_snapshot_received_at_ms = 0
+            self.last_snapshot_captured_at_ms = 0
+            self.stdout_closed_at_ms = 0
+            self._reset_sequence_guard()
+            if not restart and self.last_reason == "Browser connected":
                 self.last_reason = "브라우저 연결 끊김"
-        self.last_valid_snapshot = None
-        self._reset_sequence_guard()
 
     def wait_until_connected(self, timeout_sec=10.0):
         deadline = time.time() + max(0.1, float(timeout_sec))
         while time.time() < deadline:
             with self.lock:
-                if self.browser_connected and self.last_ready and self._is_process_running():
+                if (
+                    self.browser_connected
+                    and self.last_ready
+                    and self._is_process_running()
+                    and self._is_reader_thread_alive_locked()
+                    and self.stdout_closed_at_ms <= 0
+                ):
                     return True
                 if self.proc is not None and self.proc.poll() is not None:
                     break
@@ -570,10 +681,38 @@ class TetrioStateSource:
             detail = self.last_error or self.last_reason or "브라우저 연결 대기 중"
         raise RuntimeError(detail)
 
+    def ensure_connected(self, timeout_sec=10.0):
+        needs_reconnect = False
+        with self.lock:
+            needs_reconnect = (
+                not self._is_process_running()
+                or not self._is_reader_thread_alive_locked()
+                or self.stdout_closed_at_ms > 0
+                or not self.browser_connected
+                or not self.last_ready
+            )
+        if needs_reconnect:
+            self.reconnect()
+        return self.wait_until_connected(timeout_sec=timeout_sec)
+
+    def reconnect(self):
+        self.close(restart=True)
+        self.start()
+
+    def mark_browser_closed(self, reason="브라우저 열기를 먼저 눌러주세요."):
+        self.close(restart=False)
+        with self.lock:
+            self.last_reason = reason
+            self.last_error = ""
+            self.last_error_at = 0
+
     def get_latest_result(self, allow_start=False):
         snapshot = self.get_latest_valid_snapshot(allow_start=allow_start)
         if snapshot is None:
             return None
+        return self._build_result_from_snapshot(snapshot)
+
+    def _build_result_from_snapshot(self, snapshot):
         progress_details = resolve_effective_piece_progress_details(snapshot)
         pieces_count = progress_details["pieces_count"]
         return {
@@ -595,6 +734,58 @@ class TetrioStateSource:
             "snapshot": snapshot,
         }
 
+    def prepare_result_for_action(
+        self,
+        action_name,
+        *,
+        action_started_at_ms,
+        timeout_sec=8.0,
+        snapshot_max_age_sec=1.0,
+    ):
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        action_started_at_ms = int(action_started_at_ms)
+        self._log(f"[CDP ACTION] action={action_name}")
+
+        reconnect_attempted = False
+        while time.time() < deadline:
+            with self.lock:
+                generation = self.connection_generation
+                process_alive = self._is_process_running()
+                reader_alive = self._is_reader_thread_alive_locked()
+                stdout_closed = self.stdout_closed_at_ms > 0
+                last_ready = self.last_ready
+                browser_connected = self.browser_connected
+
+            self._log(f"[CDP ACTION] reader_alive={str(reader_alive and not stdout_closed).lower()}")
+
+            snapshot = self.get_latest_valid_snapshot(allow_start=False)
+            with self.lock:
+                fresh_snapshot_ready = self._snapshot_matches_action_locked(
+                    snapshot,
+                    max_age_sec=snapshot_max_age_sec,
+                    min_received_at_ms=action_started_at_ms,
+                    generation=generation,
+                )
+
+            if process_alive and reader_alive and not stdout_closed and browser_connected and last_ready and fresh_snapshot_ready:
+                self._log(f"[CDP ACTION] generation={generation}")
+                self._log("[CDP ACTION] fresh_snapshot_ready=true")
+                self._log(f"[CDP ACTION] running={action_name}")
+                return self._build_result_from_snapshot(snapshot)
+
+            if (not process_alive) or (not reader_alive) or stdout_closed or (not browser_connected) or (not last_ready):
+                self._log(f"[CDP ACTION] reconnecting={str(True).lower()}")
+                reconnect_attempted = True
+                self.reconnect()
+                self.wait_until_connected(timeout_sec=max(0.1, deadline - time.time()))
+                continue
+
+            time.sleep(0.05)
+
+        if reconnect_attempted:
+            self._log("[CDP ACTION] fresh_snapshot_ready=false")
+        raise RuntimeError("TETR.IO 게임 상태를 읽지 못했습니다.")
+
     def get_latest_valid_snapshot(self, allow_start=False):
         with self.lock:
             if allow_start:
@@ -607,11 +798,12 @@ class TetrioStateSource:
             elif not self._is_process_running():
                 self.last_valid_snapshot = None
                 return None
-            payload = self._read_snapshot_payload()
-            if payload is None:
+            payload_info = self._read_snapshot_payload()
+            if payload_info is None:
                 self.last_reason = "Waiting for game state"
                 self.last_valid_snapshot = None
                 return None
+            payload, received_at_ms = payload_info
 
             if not isinstance(payload, dict):
                 self._remember_error("snapshot JSON이 객체가 아닙니다.")
@@ -626,6 +818,14 @@ class TetrioStateSource:
                 self._helper_started_at_ms > 0
                 and captured_at > 0
                 and captured_at < self._helper_started_at_ms
+            ):
+                self.last_reason = "Waiting for game state"
+                self.last_valid_snapshot = None
+                return None
+            if (
+                self._helper_started_at_ms > 0
+                and received_at_ms > 0
+                and received_at_ms < self._helper_started_at_ms
             ):
                 self.last_reason = "Waiting for game state"
                 self.last_valid_snapshot = None
@@ -649,6 +849,11 @@ class TetrioStateSource:
                 self.last_valid_snapshot = None
                 return None
 
+            snapshot = replace(
+                snapshot,
+                received_at=received_at_ms,
+                connection_generation=self.connection_generation,
+            )
             if self._last_session_id != snapshot.session_id:
                 self._reset_sequence_guard()
                 self._last_session_id = snapshot.session_id
@@ -686,6 +891,9 @@ class TetrioStateSource:
             self._last_piece_counter_source = snapshot.piece_counter_source
             self._last_captured_at = snapshot.captured_at
             self._last_token = snapshot.token
+            self.last_snapshot_generation = snapshot.connection_generation
+            self.last_snapshot_received_at_ms = snapshot.received_at
+            self.last_snapshot_captured_at_ms = snapshot.captured_at
             self.last_reason = "Ready"
             self._mark_helper_success("Ready")
             return snapshot
@@ -696,13 +904,20 @@ class TetrioStateSource:
         except Exception as exc:
             self._remember_error(f"상태 갱신 실패: {exc}")
             snapshot = None
-        helper_running = self._is_process_running()
+        helper_running = self.is_process_alive()
+        reader_alive = self.is_reader_alive()
+        stdout_closed = self.has_stdout_reader_closed()
         browser_status = "Connected" if self.browser_connected else "Disconnected"
         game_state = "Ready"
         detail = self.last_reason or "브라우저 열기를 눌러주세요"
 
         if not helper_running:
             browser_status = "Disconnected"
+            game_state = "Waiting"
+            if self.last_error:
+                detail = self.last_error
+        elif stdout_closed or not reader_alive:
+            browser_status = "Reconnecting"
             game_state = "Waiting"
             if self.last_error:
                 detail = self.last_error
@@ -732,6 +947,12 @@ class TetrioStateSource:
             "last_update_age_ms": snapshot.age_ms if snapshot else None,
             "detail": detail,
             "last_log_line": self.last_log_line,
+            "reader_alive": reader_alive,
+            "process_alive": helper_running,
+            "stdout_closed": stdout_closed,
+            "connection_generation": self.connection_generation,
+            "snapshot_generation": snapshot.connection_generation if snapshot else None,
+            "received_at": snapshot.received_at if snapshot else None,
         }
 
     def _build_command(self):
@@ -810,6 +1031,16 @@ class TetrioStateSource:
         except Exception as exc:
             self._remember_error(f"helper stdout reader failed: {exc!r}")
         finally:
+            now_ms = int(time.time() * 1000)
+            pid = getattr(proc, "pid", None)
+            with self.lock:
+                self.stdout_closed_at_ms = now_ms
+            idle_seconds = 0.0
+            with self.lock:
+                idle_seconds = self._calculate_idle_seconds_locked()
+            self._log(
+                f"[CDP READER] stdout closed pid={pid if pid is not None else '?'} idle_seconds={idle_seconds:.2f}"
+            )
             exit_code = proc.poll()
             if exit_code is None:
                 self._remember_pipe_warning(
@@ -822,7 +1053,6 @@ class TetrioStateSource:
                     exit_code = None
 
             if exit_code is not None:
-                pid = getattr(proc, "pid", None)
                 intentional_close = False
                 with self.lock:
                     if pid is not None and pid in self._closing_pids:
@@ -836,9 +1066,17 @@ class TetrioStateSource:
                         self.browser_connected = False
                         self.last_ready = False
                         self.last_valid_snapshot = None
+                        self.last_snapshot_generation = 0
+                        self.last_snapshot_received_at_ms = 0
+                        self.last_snapshot_captured_at_ms = 0
                         self._reset_sequence_guard()
                         self.last_reason = "브라우저 연결 끊김"
+                    self.helper_exit_code = exit_code
+                    self.reader_exited_at_ms = int(time.time() * 1000)
+                    if self.reader_thread is not None and self.reader_thread is threading.current_thread():
+                        self.reader_thread = None
 
+                self._log(f"[CDP READER] helper exited code={exit_code}")
                 if not intentional_close:
                     self._remember_error(f"브라우저 연결 끊김 (helper exit code={exit_code})")
 
@@ -852,8 +1090,11 @@ class TetrioStateSource:
             return None
         self._last_snapshot_seen = True
         try:
+            stat = snapshot_path.stat()
             with snapshot_path.open("r", encoding="utf-8") as handle:
-                return json.load(handle)
+                payload = json.load(handle)
+            received_at_ms = int(stat.st_mtime_ns // 1_000_000)
+            return payload, received_at_ms
         except json.JSONDecodeError as exc:
             self._remember_error(f"snapshot JSON 파싱 실패: {exc}")
             return None

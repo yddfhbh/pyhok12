@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
@@ -72,6 +73,11 @@ class ExitedProc:
 
     def poll(self):
         return self.exit_code
+
+
+class AliveThread:
+    def is_alive(self):
+        return True
 
 
 class BlockingProc:
@@ -166,6 +172,14 @@ def make_state_source(snapshot_path, *, stale_after_ms=1000, required_queue_leng
     source._helper_started_at_ms = 0
     source._closing_pids = set()
     source._last_pipe_warning = ""
+    source.connection_generation = 1
+    source.last_snapshot_generation = 0
+    source.last_snapshot_received_at_ms = 0
+    source.last_snapshot_captured_at_ms = 0
+    source.stdout_closed_at_ms = 0
+    source.reader_exited_at_ms = 0
+    source.helper_exit_code = None
+    source._log = lambda message: None
     source._build_command = lambda: ["node", "browser-source/tetrio-cdp-source.mjs"]
     return source
 
@@ -456,7 +470,7 @@ class TetrioStateSourceTests(unittest.TestCase):
             source.proc.set_exit_code(0)
             reader.join(1.0)
 
-    def test_stdout_eof_reproduction_does_not_spawn_new_helper_or_reconnecting(self):
+    def test_stdout_eof_reproduction_marks_reader_as_reconnecting_without_auto_restart(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             snapshot_path = Path(tmpdir) / "live-snapshot.json"
             source = make_state_source(snapshot_path)
@@ -477,7 +491,7 @@ class TetrioStateSourceTests(unittest.TestCase):
 
             for _ in range(100):
                 status = source.get_status()
-                self.assertNotEqual(status["browser_status"], "Reconnecting")
+                self.assertEqual(status["browser_status"], "Reconnecting")
 
             self.assertEqual(start_calls, 0)
             self.assertIsNotNone(source.proc)
@@ -505,6 +519,117 @@ class TetrioStateSourceTests(unittest.TestCase):
             self.assertIsNone(source.proc)
             self.assertFalse(source.browser_connected)
             self.assertFalse(source.last_ready)
+
+    def test_is_ready_for_action_rejects_stdout_closed_reader(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source.proc = DummyProc()
+            source.reader_thread = AliveThread()
+            source.browser_connected = True
+            source.last_ready = True
+            source.stdout_closed_at_ms = int(time.time() * 1000)
+            write_snapshot(snapshot_path, make_payload())
+
+            self.assertFalse(
+                source.is_ready_for_action(
+                    max_age_sec=1.0,
+                    min_received_at_ms=0,
+                    generation=source.connection_generation,
+                )
+            )
+
+    def test_has_fresh_snapshot_rejects_previous_connection_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source.proc = DummyProc()
+            source.reader_thread = AliveThread()
+            source.browser_connected = True
+            source.last_ready = True
+            source.connection_generation = 3
+            write_snapshot(snapshot_path, make_payload())
+            snapshot = source.get_latest_valid_snapshot()
+            self.assertIsNotNone(snapshot)
+
+            previous_generation_snapshot = replace(snapshot, connection_generation=2)
+            with mock.patch.object(source, "get_latest_valid_snapshot", return_value=previous_generation_snapshot):
+                self.assertFalse(
+                    source.has_fresh_snapshot(
+                        max_age_sec=1.0,
+                        min_received_at_ms=0,
+                        generation=3,
+                    )
+                )
+
+    def test_prepare_result_for_action_reconnects_when_reader_is_dead(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source.proc = DummyProc()
+            source.reader_thread = None
+            source.browser_connected = False
+            source.last_ready = False
+            source.connection_generation = 1
+
+            reconnect_calls = []
+
+            def fake_reconnect():
+                reconnect_calls.append(True)
+                source.connection_generation = 2
+                source.proc = DummyProc()
+                source.reader_thread = AliveThread()
+                source.browser_connected = True
+                source.last_ready = True
+                write_snapshot(snapshot_path, make_payload(sessionId="session-2", token="session-2:15"))
+
+            source.reconnect = fake_reconnect
+            source.wait_until_connected = lambda timeout_sec=10.0: True
+
+            result = source.prepare_result_for_action(
+                "pc-solver",
+                action_started_at_ms=0,
+                timeout_sec=1.0,
+            )
+
+            self.assertEqual(len(reconnect_calls), 1)
+            self.assertEqual(result["snapshot"].connection_generation, 2)
+
+    def test_prepare_result_for_action_waits_for_snapshot_after_action_start(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_path = Path(tmpdir) / "live-snapshot.json"
+            source = make_state_source(snapshot_path)
+            source.proc = DummyProc()
+            source.reader_thread = AliveThread()
+            source.browser_connected = True
+            source.last_ready = True
+            action_started_at_ms = int(time.time() * 1000)
+
+            stale_payload = make_payload(capturedAt=action_started_at_ms - 50)
+            write_snapshot(snapshot_path, stale_payload)
+
+            def write_fresh_snapshot():
+                time.sleep(0.1)
+                write_snapshot(
+                    snapshot_path,
+                    make_payload(
+                        sessionId="session-2",
+                        token="session-2:15",
+                        capturedAt=int(time.time() * 1000),
+                    ),
+                )
+
+            writer = threading.Thread(target=write_fresh_snapshot, daemon=True)
+            writer.start()
+
+            result = source.prepare_result_for_action(
+                "setup-solver",
+                action_started_at_ms=action_started_at_ms,
+                timeout_sec=1.0,
+            )
+            writer.join(1.0)
+
+            self.assertGreaterEqual(result["snapshot"].received_at, action_started_at_ms)
 
     def test_actual_exit_does_not_restart_helper_automatically(self):
         with tempfile.TemporaryDirectory() as tmpdir:

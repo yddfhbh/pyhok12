@@ -12,6 +12,8 @@ class FakeStateSource:
         self.closed = 0
         self.running = False
         self.wait_calls = 0
+        self.ensure_connected_calls = 0
+        self.prepare_calls = []
         self.latest_result_calls = []
         self.latest_result = None
         self.status = {
@@ -40,9 +42,36 @@ class FakeStateSource:
     def is_running(self):
         return self.running
 
+    def is_process_alive(self):
+        return self.running
+
+    def is_reader_alive(self):
+        return self.running
+
+    def ensure_connected(self, timeout_sec=10):
+        self.ensure_connected_calls += 1
+        if not self.running:
+            self.started += 1
+            self.running = True
+        return True
+
     def wait_until_connected(self, timeout_sec=10):
         self.wait_calls += 1
         return True
+
+    def prepare_result_for_action(self, action_name, *, action_started_at_ms, timeout_sec=8.0):
+        self.prepare_calls.append(
+            {
+                "action_name": action_name,
+                "action_started_at_ms": action_started_at_ms,
+                "timeout_sec": timeout_sec,
+            }
+        )
+        return self.latest_result
+
+    def mark_browser_closed(self, reason="브라우저 열기를 먼저 눌러주세요."):
+        self.status["detail"] = reason
+        self.running = False
 
     def close(self):
         self.closed += 1
@@ -210,54 +239,37 @@ class MainUiTests(unittest.TestCase):
         self.assertLessEqual(actual_height, 900)
         self.assertGreaterEqual(actual_height, self.root.winfo_reqheight())
 
-    def test_pc_button_keeps_existing_solver_callback(self):
-        with (
-            mock.patch.object(self.app, "ensure_browser_source_for_action", return_value=True) as ensure_mock,
-            mock.patch.object(self.app, "scan") as scan_mock,
-        ):
-            self.app.scan_for_pc_solve(show_popup=False)
+    def test_pc_button_routes_through_common_browser_action(self):
+        with mock.patch.object(self.app, "run_action_with_browser_source") as action_mock:
+            self.app.on_pc_solver_requested(show_popup=False)
 
-        ensure_mock.assert_called_once_with(show_popup=False)
-        scan_mock.assert_called_once_with(scan_target="pc_solve", show_popup=False)
+        action_mock.assert_called_once()
+        self.assertEqual(action_mock.call_args.args[0], "pc-solver")
+        self.assertEqual(action_mock.call_args.args[1], self.app.execute_pc_solver)
+        self.assertEqual(action_mock.call_args.kwargs["show_popup"], False)
 
-    def test_setup_button_keeps_existing_setup_callback(self):
-        with (
-            mock.patch.object(self.app, "ensure_browser_source_for_action", return_value=True) as ensure_mock,
-            mock.patch.object(self.app, "scan") as scan_mock,
-        ):
-            self.app.scan_for_setup_finder(show_popup=False)
+    def test_setup_button_routes_through_common_browser_action(self):
+        with mock.patch.object(self.app, "run_action_with_browser_source") as action_mock:
+            self.app.on_setup_requested(show_popup=False)
 
-        ensure_mock.assert_called_once_with(show_popup=False)
-        scan_mock.assert_called_once_with(scan_target="setup", show_popup=False)
+        action_mock.assert_called_once()
+        self.assertEqual(action_mock.call_args.args[0], "setup-solver")
+        self.assertEqual(action_mock.call_args.args[1], self.app.execute_setup_solver)
+        self.assertEqual(action_mock.call_args.kwargs["show_popup"], False)
 
-    def test_pc_button_without_browser_only_shows_prompt(self):
-        with (
-            mock.patch.object(main, "is_cdp_endpoint_available", return_value=False),
-            mock.patch.object(self.app, "scan") as scan_mock,
-        ):
-            self.app.scan_for_pc_solve(show_popup=False)
+    def test_delete_hotkey_uses_common_pc_request_path(self):
+        with mock.patch.object(self.app, "on_pc_solver_requested") as request_mock:
+            result = self.app.on_local_delete_hotkey()
 
-        scan_mock.assert_not_called()
-        self.assertEqual(self.app.state_source.started, 0)
-        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 먼저 눌러주세요.")
+        request_mock.assert_called_once_with(show_popup=False)
+        self.assertEqual(result, "break")
 
-    def test_setup_button_without_browser_only_shows_prompt(self):
-        with (
-            mock.patch.object(main, "is_cdp_endpoint_available", return_value=False),
-            mock.patch.object(self.app, "scan") as scan_mock,
-        ):
-            self.app.scan_for_setup_finder(show_popup=False)
+    def test_end_hotkey_uses_common_setup_request_path(self):
+        with mock.patch.object(self.app, "on_setup_requested") as request_mock:
+            result = self.app.on_local_end_hotkey()
 
-        scan_mock.assert_not_called()
-        self.assertEqual(self.app.state_source.started, 0)
-        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 먼저 눌러주세요.")
-
-    def test_action_buttons_lazy_connect_when_cdp_is_open(self):
-        with mock.patch.object(main, "is_cdp_endpoint_available", return_value=True):
-            connected = self.app.ensure_browser_source_for_action(show_popup=False)
-
-        self.assertTrue(connected)
-        self.assertEqual(self.app.state_source.started, 1)
+        request_mock.assert_called_once_with(show_popup=False)
+        self.assertEqual(result, "break")
 
     def test_open_browser_worker_uses_existing_cdp_without_relaunch(self):
         self.app._post_to_ui = lambda callback, *args: callback(*args)
@@ -310,6 +322,84 @@ class MainUiTests(unittest.TestCase):
 
         self.assertEqual(self.app.browser_status_var.get(), "Browser: Open")
         self.assertIn("브라우저가 열려 있습니다", self.app.detail_var.get())
+
+    def test_browser_action_path_prompts_when_cdp_port_is_closed(self):
+        self.app._post_to_ui = lambda callback, *args: callback(*args)
+        callback = mock.Mock()
+
+        with mock.patch.object(main, "is_cdp_endpoint_available", return_value=False):
+            self.app._run_action_with_browser_source_worker(
+                "pc-solver",
+                callback,
+                False,
+                123456,
+            )
+
+        callback.assert_not_called()
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 열기를 먼저 눌러주세요.")
+        self.assertEqual(self.app.state_source.prepare_calls, [])
+
+    def test_browser_action_path_uses_state_source_prepare_once(self):
+        self.app._post_to_ui = lambda callback, *args: callback(*args)
+        prepared = make_result(current="L", hold="S", queue=["O", "I", "Z", "J", "T"])
+        self.app.state_source.latest_result = prepared
+        callback = mock.Mock()
+
+        with mock.patch.object(main, "is_cdp_endpoint_available", return_value=True):
+            self.app._run_action_with_browser_source_worker(
+                "pc-solver",
+                callback,
+                False,
+                987654,
+            )
+
+        callback.assert_called_once_with(prepared)
+        self.assertEqual(len(self.app.state_source.prepare_calls), 1)
+        self.assertEqual(self.app.state_source.prepare_calls[0]["action_name"], "pc-solver")
+        self.assertEqual(self.app.status_label.cget("text"), "브라우저 연결됨")
+
+    def test_browser_action_path_does_not_duplicate_when_already_preparing(self):
+        self.app.browser_action_in_progress = True
+        callback = mock.Mock()
+
+        with mock.patch.object(main.threading, "Thread") as thread_mock:
+            self.app.run_action_with_browser_source("pc-solver", callback, show_popup=False)
+
+        thread_mock.assert_not_called()
+        callback.assert_not_called()
+
+    def test_browser_action_failure_reenables_buttons(self):
+        self.app.browser_action_in_progress = True
+        self.app.update_action_buttons_state()
+
+        self.app._on_browser_action_error("TETR.IO 게임 상태를 읽지 못했습니다.", False)
+
+        self.assertFalse(self.app.browser_action_in_progress)
+        self.assertEqual(self.app.status_label.cget("text"), "TETR.IO 게임 상태를 읽지 못했습니다.")
+        self.assertEqual(self.app.pc_scan_button.cget("state"), "normal")
+        self.assertEqual(self.app.setup_scan_button.cget("state"), "normal")
+
+    def test_execute_setup_solver_uses_prepared_snapshot_without_rescan(self):
+        result = make_result(current="T", hold="I", queue=["L", "S", "O", "Z", "J"])
+        variants = [{"title": "1. ACTIVE 시작", "setup": {"id": "abc"}, "queue_text": "TLSZOJ"}]
+
+        with (
+            mock.patch.object(self.app, "build_setup_variants", return_value=variants),
+            mock.patch.object(self.app, "render_setup_groups") as render_mock,
+        ):
+            self.app.execute_setup_solver(result)
+
+        render_mock.assert_called_once_with(variants)
+        self.assertEqual(self.app.last_result, result)
+
+    def test_execute_pc_solver_uses_prepared_snapshot_without_rescan(self):
+        result = make_result(current="T", hold="I", queue=["L", "S", "O", "Z", "J"])
+
+        with mock.patch.object(self.app, "run_pc_solver_now") as solver_mock:
+            self.app.execute_pc_solver(result)
+
+        solver_mock.assert_called_once_with(show_popup=False, force=True)
+        self.assertEqual(self.app.last_result, result)
 
     def test_run_pc_solver_uses_snapshot_current_hold_and_queue(self):
         fake_thread = FakeThread()
