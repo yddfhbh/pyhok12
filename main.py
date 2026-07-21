@@ -75,6 +75,15 @@ DEFAULT_PIECE_COLORS = {
         "Z": [235, 79, 101],
         "G": [134, 134, 134],
 }
+AUTOMATIC_SETUP_OPTIONS_BY_ROUND = {
+        1: {"mode": "Simple", "priority": "LITZS"},
+        2: {"mode": "Advanced", "priority": "TLSOZJI"},
+        3: {"mode": "Advanced", "priority": "SSLOIJ"},
+        4: {"priority": "TZJOISL"},
+        5: {"allow_3p": True, "allow_4p": True, "allow_bd": True},
+        6: {"specific_sol": True, "priority": "LTIJOS"},
+        7: {"priority": "IJTZLO"},
+}
 
 
 def get_tetrio_cdp_config(config):
@@ -209,7 +218,6 @@ class TetrisScannerApp:
         self.last_result = None
         self.last_scan_signature = None
         self.current_output_mode = "placeholder"
-        self.setup_option_refresh_job = None
         self.state_status_job = None
 
         self.auto_scan_interval_ms = 500
@@ -289,7 +297,7 @@ class TetrisScannerApp:
             command=self.toggle_topmost,
             font=("Malgun Gothic", 10),
         )
-        self.topmost_check.pack(pady=(0, 4))
+        self.topmost_check.pack(anchor="w", padx=16, pady=(0, 6))
         self.pc_round_label = tk.Label(
             root,
             text="현재 PC: -",
@@ -312,14 +320,6 @@ class TetrisScannerApp:
             font=("Malgun Gothic", 10, "bold"),
         )
         self.pc_solver_status_label.pack(fill="x", padx=16, pady=(0, 6))
-
-        self.setup_option_frame = tk.LabelFrame(
-            root,
-            text="SETUP OPTIONS",
-            font=("Malgun Gothic", 10, "bold"),
-        )
-        self.setup_option_frame.pack(fill="x", padx=14, pady=(0, 6))
-        self.build_setup_option_controls()
 
         self.main_frame = tk.Frame(root)
         self.main_frame.pack(padx=12, pady=8)
@@ -407,7 +407,7 @@ class TetrisScannerApp:
         self.last_pc_signature = None
         self.root.update_idletasks()
         required_height = self.root.winfo_reqheight()
-        target_height = min(max(required_height + 12, 870), 900)
+        target_height = required_height + 12
         self.root.geometry(f"620x{target_height}")
 
     def bind_keyboard_shortcuts(self):
@@ -487,110 +487,6 @@ class TetrisScannerApp:
     def reset_output_scroll(self):
         self.output.yview_moveto(0)
 
-    def get_default_setup_option_config(self):
-        return {
-            1: {"mode": "Simple", "priority": "LITZS"},
-            2: {"mode": "Advanced", "priority": "TLSOZJI"},
-            3: {"mode": "Advanced", "priority": "SSLOIJ"},
-            4: {"priority": "TZJOISL"},
-            5: {"allow_3p": True, "allow_4p": True, "allow_bd": True},
-            6: {"specific_sol": True, "priority": "LTIJOS"},
-            7: {"priority": "IJTZLO"},
-        }
-
-    def build_setup_option_controls(self):
-        defaults = self.get_default_setup_option_config()
-        self.setup_option_vars = {}
-
-        for col in range(7):
-            self.setup_option_frame.grid_columnconfigure(col, weight=1)
-
-        font_small = ("Consolas", 7)
-
-        for round_num in range(1, 8):
-            group = tk.Frame(self.setup_option_frame, bd=1, relief="solid", padx=2, pady=1)
-            group.grid(row=0, column=round_num - 1, padx=1, pady=2, sticky="nsew")
-            tk.Label(
-                group,
-                text=f"{round_num}st PC" if round_num == 1 else f"{round_num}nd PC" if round_num == 2 else f"{round_num}rd PC" if round_num == 3 else f"{round_num}th PC",
-                font=("Consolas", 7, "bold"),
-            ).grid(row=0, column=0, sticky="ew", pady=(0, 1))
-
-            round_vars = {}
-            default = defaults.get(round_num, {})
-
-            if round_num in (1, 2, 3):
-                mode_var = tk.StringVar(value=default.get("mode", "Simple"))
-                mode_menu = tk.OptionMenu(group, mode_var, "Simple", "Advanced")
-                mode_menu.config(font=font_small, width=7, padx=1, pady=0, indicatoron=False)
-                mode_menu["menu"].config(font=font_small)
-                mode_menu.grid(row=1, column=0, sticky="ew")
-                round_vars["mode"] = mode_var
-
-                priority_var = tk.StringVar(value=default.get("priority", ""))
-                self.create_setup_option_value_label(group, priority_var, row=2)
-                round_vars["priority"] = priority_var
-            elif round_num == 5:
-                allow_3p_var = tk.BooleanVar(value=bool(default.get("allow_3p", True)))
-                allow_4p_var = tk.BooleanVar(value=bool(default.get("allow_4p", True)))
-                allow_bd_var = tk.BooleanVar(value=bool(default.get("allow_bd", True)))
-                tk.Checkbutton(group, text="3P", variable=allow_3p_var, font=font_small, anchor="w").grid(
-                    row=1, column=0, sticky="w"
-                )
-                tk.Checkbutton(group, text="4P", variable=allow_4p_var, font=font_small, anchor="w").grid(
-                    row=2, column=0, sticky="w"
-                )
-                tk.Checkbutton(group, text="BD", variable=allow_bd_var, font=font_small, anchor="w").grid(
-                    row=3, column=0, sticky="w"
-                )
-                round_vars["allow_3p"] = allow_3p_var
-                round_vars["allow_4p"] = allow_4p_var
-                round_vars["allow_bd"] = allow_bd_var
-            elif round_num == 6:
-                specific_sol_var = tk.BooleanVar(value=bool(default.get("specific_sol", True)))
-                tk.Checkbutton(
-                    group,
-                    text="Specific Sol%",
-                    variable=specific_sol_var,
-                    font=("Consolas", 6),
-                    anchor="w",
-                ).grid(row=1, column=0, sticky="w")
-                priority_var = tk.StringVar(value=default.get("priority", ""))
-                self.create_setup_option_value_label(group, priority_var, row=2)
-                round_vars["specific_sol"] = specific_sol_var
-                round_vars["priority"] = priority_var
-            else:
-                priority_var = tk.StringVar(value=default.get("priority", ""))
-                self.create_setup_option_value_label(group, priority_var, row=1)
-                round_vars["priority"] = priority_var
-
-            for variable in round_vars.values():
-                variable.trace_add("write", self.on_setup_option_changed)
-
-            self.setup_option_vars[round_num] = round_vars
-
-        tk.Label(
-            self.setup_option_frame,
-            text="큐는 최신 CDP snapshot 값을 자동 사용합니다.",
-            anchor="w",
-            font=("Malgun Gothic", 7),
-            fg="#6f6a61",
-        ).grid(row=1, column=0, columnspan=7, sticky="w", padx=3, pady=(0, 1))
-
-    def create_setup_option_value_label(self, parent, variable, row):
-        holder = tk.Frame(parent, bd=1, relief="sunken", bg="#fbfbfb")
-        holder.grid(row=row, column=0, sticky="ew", pady=(1, 0))
-        tk.Label(
-            holder,
-            textvariable=variable,
-            font=("Consolas", 7, "bold"),
-            bg="#fbfbfb",
-            fg="#2d2d2d",
-            justify="center",
-            padx=3,
-            pady=1,
-        ).pack(fill="x")
-
     def build_state_status_panel(self):
         self.state_frame = tk.LabelFrame(
             self.root,
@@ -658,45 +554,6 @@ class TetrisScannerApp:
         )
         self.output.config(scrollregion=(0, 0, self.solve_canvas_width, self.solve_canvas_height))
         self.reset_output_scroll()
-
-    def get_setup_options_by_round(self):
-        options = {}
-        for round_num, round_vars in getattr(self, "setup_option_vars", {}).items():
-            round_options = {}
-            if "mode" in round_vars:
-                round_options["mode"] = (round_vars["mode"].get() or "").strip()
-            if "priority" in round_vars:
-                round_options["priority"] = (round_vars["priority"].get() or "").strip().upper()
-            if "allow_3p" in round_vars:
-                round_options["allow_3p"] = bool(round_vars["allow_3p"].get())
-            if "allow_4p" in round_vars:
-                round_options["allow_4p"] = bool(round_vars["allow_4p"].get())
-            if "allow_bd" in round_vars:
-                round_options["allow_bd"] = bool(round_vars["allow_bd"].get())
-            if "specific_sol" in round_vars:
-                round_options["specific_sol"] = bool(round_vars["specific_sol"].get())
-            options[round_num] = round_options
-        return options
-
-    def on_setup_option_changed(self, *_args):
-        if self.setup_option_refresh_job is not None:
-            self.root.after_cancel(self.setup_option_refresh_job)
-        self.setup_option_refresh_job = self.root.after(120, self.refresh_setup_options_preview)
-
-    def refresh_setup_options_preview(self):
-        self.setup_option_refresh_job = None
-
-        if self.current_output_mode != "setup" or not self.last_result:
-            return
-
-        variants = self.build_setup_variants(self.last_result)
-        round_text = self.build_round_status_suffix(self.last_result)
-        if variants:
-            self.render_setup_groups(variants)
-            self.status_label.config(text=f"최적 셋업 옵션 반영 완료{round_text}")
-        else:
-            self.render_setup_empty_state("현재 옵션으로\n최적 셋업을 찾지 못했습니다.")
-            self.status_label.config(text=f"현재 옵션으로 최적 셋업 없음{round_text}")
 
     def get_scan_context(self, solver_result=None):
         result = self.last_result or {}
@@ -1749,7 +1606,7 @@ class TetrisScannerApp:
             )
             return []
 
-        setup_options = self.get_setup_options_by_round()
+        setup_options = AUTOMATIC_SETUP_OPTIONS_BY_ROUND
 
         state_queue = make_state_queue(active, queue)
         candidates = []

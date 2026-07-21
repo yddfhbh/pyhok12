@@ -87,7 +87,19 @@ def make_config():
         "tetrio_cdp": {
             "port": 9222,
             "url": "https://tetr.io/",
-        }
+        },
+        "pc1_mode": "Simple",
+        "pc2_mode": "Advanced",
+        "pc_queue_overrides": {
+            "1": "LITZS",
+            "2": "TLSOZJI",
+        },
+        "setup_options": {
+            "allow_3p": True,
+            "allow_4p": True,
+            "allow_bd": True,
+            "specific_sol": True,
+        },
     }
 
 
@@ -228,6 +240,47 @@ class MainUiTests(unittest.TestCase):
         ]
         self.assertTrue(all(value for value in values))
 
+    def test_manual_setup_options_frame_and_widgets_are_removed(self):
+        self.assertFalse(hasattr(self.app, "setup_option_frame"))
+        all_texts = []
+        pending = [self.root]
+        while pending:
+            widget = pending.pop()
+            pending.extend(widget.winfo_children())
+            try:
+                all_texts.append(widget.cget("text"))
+            except tk.TclError:
+                continue
+
+        joined = "\n".join(text for text in all_texts if text)
+        self.assertNotIn("SETUP OPTIONS", joined)
+        self.assertNotIn("1st PC", joined)
+        self.assertNotIn("7th PC", joined)
+        self.assertNotIn("Simple", joined)
+        self.assertNotIn("Advanced", joined)
+        self.assertNotIn("3P", joined)
+        self.assertNotIn("4P", joined)
+        self.assertNotIn("BD", joined)
+        self.assertNotIn("큐는 최신 CDP snapshot 값을 자동 사용합니다.", joined)
+
+    def test_manual_setup_state_members_and_helpers_are_removed(self):
+        self.assertFalse(hasattr(self.app, "setup_option_refresh_job"))
+        self.assertFalse(hasattr(self.app, "setup_option_vars"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "get_default_setup_option_config"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "build_setup_option_controls"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "create_setup_option_value_label"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "get_setup_options_by_round"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "on_setup_option_changed"))
+        self.assertFalse(hasattr(main.TetrisScannerApp, "refresh_setup_options_preview"))
+
+    def test_legacy_manual_setup_config_keys_are_ignored(self):
+        self.assertEqual(self.app.config["pc1_mode"], "Simple")
+        self.assertEqual(self.app.config["pc2_mode"], "Advanced")
+        self.assertIn("pc_queue_overrides", self.app.config)
+        self.assertIn("setup_options", self.app.config)
+        self.assertEqual(self.app.setup_scan_button.cget("text"), "최적 셋업 찾기")
+        self.assertEqual(self.app.pc_scan_button.cget("text"), "PC 해법 찾기")
+
     def test_window_height_is_reduced_without_clipping(self):
         geometry = self.root.geometry().split("+")[0]
         width_text, height_text = geometry.split("x")
@@ -235,8 +288,7 @@ class MainUiTests(unittest.TestCase):
         actual_height = int(height_text)
 
         self.assertEqual(actual_width, 620)
-        self.assertGreaterEqual(actual_height, 870)
-        self.assertLessEqual(actual_height, 900)
+        self.assertLess(actual_height, 870)
         self.assertGreaterEqual(actual_height, self.root.winfo_reqheight())
 
     def test_pc_button_routes_through_common_browser_action(self):
@@ -573,6 +625,10 @@ class MainUiTests(unittest.TestCase):
             variants = self.app.build_setup_variants(result)
 
         self.assertEqual(finder_mock.call_args.args[1], 1)
+        self.assertEqual(
+            finder_mock.call_args.kwargs["options"],
+            main.AUTOMATIC_SETUP_OPTIONS_BY_ROUND,
+        )
         self.assertEqual(len(variants), 1)
 
     def test_should_show_setup_recommendation_accepts_current_separate_from_locked_board(self):
