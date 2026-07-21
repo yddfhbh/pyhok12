@@ -1457,9 +1457,9 @@ class TetrisScannerApp:
         self.current_output_mode = "setup"
 
         card_width = 132
-        card_height = 164
+        card_height = 146
         gap_x = 12
-        gap_y = 14
+        gap_y = 12
         start_x = 8
         start_y = self.draw_output_context_header()
         visible = variants[:6]
@@ -1489,14 +1489,11 @@ class TetrisScannerApp:
         display_lookup_text = variant.get("display_lookup_text") or lookup_queue_text
         round_text = variant.get("round_text") or "-"
         setup_id = setup.get("id", "-")
-        option_label = setup.get("option_label", "")
         preview_rows = variant.get("preview_rows") or []
         match_text = setup.get("match", "")
         percent_text = setup.get("percent", "")
         display_sequence = match_text or display_lookup_text[:5]
-        detail_text = f"MATCH {match_text}" if match_text else f"LOOKUP {display_lookup_text}"
-        if percent_text:
-            detail_text += f" ({percent_text})"
+        success_rate_text = self.format_setup_success_rate_text(percent_text)
 
         self.output.create_rectangle(
             x,
@@ -1514,15 +1511,6 @@ class TetrisScannerApp:
             fill="#252525",
             font=("Consolas", 10, "bold"),
         )
-        if option_label:
-            self.output.create_text(
-                x + width - 10,
-                y + 12,
-                text=option_label,
-                anchor="e",
-                fill="#816d3d",
-                font=("Consolas", 8, "bold"),
-            )
         self.output.create_text(
             x + 10,
             y + 32,
@@ -1563,19 +1551,28 @@ class TetrisScannerApp:
         self.output.create_text(
             x + 10,
             y + 126,
-            text=detail_text,
+            text=success_rate_text,
             anchor="w",
             fill="#3a3a3a",
             font=("Consolas", 9),
         )
-        self.output.create_text(
-            x + 10,
-            y + 144,
-            text=f"SOL {setup.get('sol', '-')} / STATE {queue_text[:6]}",
-            anchor="w",
-            fill="#3a3a3a",
-            font=("Consolas", 8),
-        )
+
+    def format_setup_success_rate_text(self, percent_text):
+        normalized = str(percent_text or "").strip()
+        if not normalized:
+            return "성공 확률 계산 불가"
+
+        if normalized.endswith("%"):
+            normalized = normalized[:-1].strip()
+
+        try:
+            value = float(normalized)
+        except (TypeError, ValueError):
+            return "성공 확률 계산 불가"
+
+        if abs(value - 100.0) < 0.005:
+            return "성공 확률 100%"
+        return f"성공 확률 {value:.2f}%"
 
     def build_setup_variants(self, result):
         if find_setup_for_pc is None:

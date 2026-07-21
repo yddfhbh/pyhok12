@@ -609,6 +609,45 @@ class MainUiTests(unittest.TestCase):
         render_mock.assert_called_once_with(variants)
         self.assertIn("최적 셋업", self.app.status_label.cget("text"))
 
+    def test_render_setup_card_shows_only_short_success_rate_text(self):
+        variant = {
+            "title": "1. ACTIVE 시작",
+            "queue_text": "TLSZOJ",
+            "lookup_queue_text": "TLSZOJ",
+            "display_lookup_text": "TLSZOJ",
+            "round_text": "1라운드 | 4/10p | B1",
+            "preview_rows": [".........." for _ in range(4)],
+            "setup": {
+                "id": "4-05M",
+                "match": "TLSZO",
+                "percent": "98.51%",
+                "sol": "TLSZO-98.51%",
+                "option_label": "Specific Sol%",
+            },
+        }
+
+        self.app.render_setup_groups([variant])
+        texts = self.get_canvas_texts()
+
+        self.assertIn("1. ACTIVE 시작", texts)
+        self.assertIn("1라운드 | 4/10p | B1", texts)
+        self.assertIn("SEQ", texts)
+        self.assertIn("4-05M", texts)
+        self.assertIn("성공 확률 98.51%", texts)
+        self.assertFalse(any("MATCH" in text for text in texts))
+        self.assertFalse(any("SOL " in text for text in texts))
+        self.assertFalse(any("STATE " in text for text in texts))
+        self.assertFalse(any("Specific Sol%" in text for text in texts))
+        self.assertEqual(variant["setup"]["match"], "TLSZO")
+        self.assertEqual(variant["setup"]["sol"], "TLSZO-98.51%")
+        self.assertEqual(variant["queue_text"], "TLSZOJ")
+
+    def test_format_setup_success_rate_text_handles_100_and_invalid_values(self):
+        self.assertEqual(self.app.format_setup_success_rate_text("100.00%"), "성공 확률 100%")
+        self.assertEqual(self.app.format_setup_success_rate_text("100%"), "성공 확률 100%")
+        self.assertEqual(self.app.format_setup_success_rate_text(""), "성공 확률 계산 불가")
+        self.assertEqual(self.app.format_setup_success_rate_text("N/A"), "성공 확률 계산 불가")
+
     def test_build_setup_variants_uses_current_on_empty_locked_board(self):
         result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])
         result["pieces_count"] = 0
