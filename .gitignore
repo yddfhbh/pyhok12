@@ -16,3 +16,8 @@ tools/hydra/tree_data.js
 
 # 빌드 결과물 제외하고 싶으면 이것도 켜기
 # tools/hydra/hydra_solver.exe
+dist/
+build/
+*.spec
+tools/node.exe
+runtime/node.exe

@@ -1,22 +1,22 @@
-param(
-    [string]$NodeExe = ""
-)
-
 $ErrorActionPreference = "Stop"
 
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectRoot = $PSScriptRoot
 Set-Location $ProjectRoot
 
-if (-not $NodeExe) {
-    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $nodeCommand) {
-        throw "node.exe를 찾지 못했습니다. -NodeExe 로 직접 지정해 주세요."
-    }
-    $NodeExe = $nodeCommand.Source
-}
+$requiredPaths = @(
+    (Join-Path $PSScriptRoot "browser-source\tetrio-cdp-source.mjs"),
+    (Join-Path $PSScriptRoot "browser-source\chromium-launch.mjs"),
+    (Join-Path $PSScriptRoot "browser-source\ddd-ws-observer.mjs"),
+    (Join-Path $PSScriptRoot "browser-source\vs-ws-bridge.mjs"),
+    (Join-Path $PSScriptRoot "node_modules"),
+    (Join-Path $PSScriptRoot "package.json"),
+    (Join-Path $PSScriptRoot "tools\node.exe")
+)
 
-if (-not (Test-Path -LiteralPath $NodeExe)) {
-    throw "node.exe 경로가 없습니다: $NodeExe"
+foreach ($requiredPath in $requiredPaths) {
+    if (-not (Test-Path -LiteralPath $requiredPath)) {
+        throw "Required build input is missing: $requiredPath"
+    }
 }
 
 Write-Host "Installing PyInstaller..."
@@ -43,15 +43,18 @@ $pyInstallerArgs = @(
     "--onefile",
     "--windowed",
     "--name", "TetrisScan",
-    "--add-data", "config.json;.",
-    "--add-data", "tools\hydra;tools\hydra",
-    "--add-data", "tools\gomen.js;tools",
-    "--add-data", "tools\gomen_bg.wasm;tools",
-    "--add-data", "tools\gomen_solver.js;tools",
-    "--add-data", "tools\legal-boards.leb128;tools",
-    "--add-data", "tools\setup_finder\setup_data.json;tools\setup_finder",
-    "--add-binary", "$NodeExe;tools",
-    "main.py"
+    "--add-data", "$PSScriptRoot\config.json;.",
+    "--add-data", "$PSScriptRoot\browser-source;browser-source",
+    "--add-data", "$PSScriptRoot\node_modules;node_modules",
+    "--add-data", "$PSScriptRoot\package.json;.",
+    "--add-data", "$PSScriptRoot\tools\hydra;tools\hydra",
+    "--add-data", "$PSScriptRoot\tools\gomen.js;tools",
+    "--add-data", "$PSScriptRoot\tools\gomen_bg.wasm;tools",
+    "--add-data", "$PSScriptRoot\tools\gomen_solver.js;tools",
+    "--add-data", "$PSScriptRoot\tools\legal-boards.leb128;tools",
+    "--add-data", "$PSScriptRoot\tools\setup_finder\setup_data.json;tools\setup_finder",
+    "--add-binary", "$PSScriptRoot\tools\node.exe;tools",
+    "$PSScriptRoot\main.py"
 )
 
 Write-Host "Building EXE..."
