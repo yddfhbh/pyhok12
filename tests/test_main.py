@@ -616,6 +616,7 @@ class MainUiTests(unittest.TestCase):
             "lookup_queue_text": "TLSZOJ",
             "display_lookup_text": "TLSZOJ",
             "round_text": "1라운드 | 4/10p | B1",
+            "success_rate": 98.51,
             "preview_rows": [".........." for _ in range(4)],
             "setup": {
                 "id": "4-05M",
@@ -681,7 +682,8 @@ class MainUiTests(unittest.TestCase):
         self.assertEqual(variants[0]["setup"]["percent"], None)
         self.assertEqual(variants[3]["title"], "4. HOLD")
         printed = "\n".join(" ".join(str(arg) for arg in call.args) for call in print_mock.call_args_list)
-        self.assertIn("[SETUP FILTER] reason=missing_success_rate name=ID sequence=I", printed)
+        self.assertIn("[SETUP FILTER] reason=missing_success_rate round=- name=ID sequence=I", printed)
+        self.assertIn("checked_sources=", printed)
         self.assertIn("name=NAN sequence=L", printed)
         self.assertIn("name=OUTSIDE sequence=Z", printed)
 
@@ -692,6 +694,65 @@ class MainUiTests(unittest.TestCase):
 
         self.assertEqual(self.app.output_hint_var.get(), "확률을 계산할 수 있는 셋업이 없습니다.")
         self.assertIn("확률을 계산할 수 있는 셋업이 없습니다.", self.get_canvas_texts())
+
+    def test_resolve_setup_success_rate_uses_actual_setup_finder_round_formats(self):
+        cases = {
+            1: "JLSZT",
+            2: "TILJ",
+            3: "TILZO",
+            4: "TILSZO",
+            5: "TTLO",
+            6: "TLOIJSZ",
+            7: "TLJ",
+        }
+
+        for pc_round, queue in cases.items():
+            with self.subTest(pc_round=pc_round):
+                candidate = main.find_setup_candidates_for_pc(queue, pc_round, limit=1)[0]
+                context = {"display_lookup_text": candidate["queue"]}
+                rate = self.app.resolve_setup_success_rate(candidate["result"], pc_round, context)
+                self.assertIsNotNone(rate)
+                self.assertGreaterEqual(rate, 0)
+                self.assertLessEqual(rate, 100)
+
+    def test_fifth_round_3p_4p_and_bd_rows_use_their_actual_sol_ratios(self):
+        from tools.setup_finder.setup_finder import load_setup_data
+
+        rows = load_setup_data()["fifth"]
+        cases = {
+            "3P": next(row for row in rows if row.get("piece_count") == 3),
+            "4P": next(row for row in rows if row.get("piece_count") == 4),
+            "BD": next(row for row in rows if row.get("piece_count", 0) >= 7),
+        }
+        for label, row in cases.items():
+            with self.subTest(option=label, setup_id=row["id"]):
+                rate = self.app.resolve_setup_success_rate({"sol": row["sol"]}, 5, {})
+                self.assertIsNotNone(rate)
+                self.assertGreaterEqual(rate, 0)
+                self.assertLessEqual(rate, 100)
+
+    def test_round_two_actual_candidates_are_not_all_filtered(self):
+        candidates = main.find_setup_candidates_for_pc("TILJ", 2, limit=3)
+        variants = []
+        for index, candidate in enumerate(candidates, start=1):
+            setup = candidate["result"]
+            context = {"display_lookup_text": candidate["queue"], "sequence": candidate["queue"]}
+            variants.append(
+                {
+                    "title": f"{index}. ACTIVE",
+                    "queue_text": candidate["queue"],
+                    "display_lookup_text": candidate["queue"],
+                    "setup": setup,
+                    "pc_round": 2,
+                    "success_rate": self.app.resolve_setup_success_rate(setup, 2, context),
+                    "success_rate_context": context,
+                }
+            )
+
+        self.assertTrue(self.app.filter_setup_variants_for_rendering(variants))
+
+    def test_resolve_setup_success_rate_does_not_use_priority_as_a_rate(self):
+        self.assertIsNone(self.app.resolve_setup_success_rate({"priority": 98.51}, 2, {}))
 
     def test_build_setup_variants_uses_current_on_empty_locked_board(self):
         result = make_result(current="I", active_guess="", hold="", queue=["T", "L", "S", "O", "Z"])

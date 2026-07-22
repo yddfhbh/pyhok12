@@ -1496,16 +1496,52 @@ class TetrisScannerApp:
         visible = []
         for variant in variants or []:
             setup = variant.get("setup") or {}
-            if self.parse_setup_success_rate(setup.get("percent")) is None:
-                sequence = setup.get("match") or variant.get("display_lookup_text") or variant.get("lookup_queue_text") or variant.get("queue_text") or ""
+            context = variant.get("success_rate_context") or {
+                "display_lookup_text": variant.get("display_lookup_text"),
+                "sequence": setup.get("match") or variant.get("display_lookup_text"),
+            }
+            pc_round = variant.get("pc_round")
+            rate = variant.get("success_rate")
+            if rate is None:
+                rate = self.resolve_setup_success_rate(setup, pc_round, context)
+
+            if pc_round in (2, 3, 4, 5, 6, 7):
+                print("[SETUP RATE DEBUG]")
+                print(f"round={pc_round}")
+                print(f"name={setup.get('id') or '-'}")
+                print(f"sequence={context.get('sequence') or '-'}")
+                print(f"keys={sorted(setup.keys())}")
+                print(f"match={setup.get('match')!r}")
+                print(f"sol={setup.get('sol')!r}")
+                print(f"specific_sol={setup.get('specific_sol')!r}")
+                print(f"display_lookup_text={context.get('display_lookup_text')!r}")
+                print(f"raw_candidate={self.describe_setup_rate_data(setup)}")
+
+            if rate is not None:
                 print(
-                    "[SETUP FILTER]"
-                    " reason=missing_success_rate"
+                    "[SETUP RATE]"
+                    f" round={pc_round or '-'}"
                     f" name={setup.get('id') or '-'}"
-                    f" sequence={sequence}"
+                    f" source={context.get('rate_source', '-') }"
+                    f" raw={context.get('rate_raw')!r}"
+                    f" normalized={rate:.2f}"
                 )
+                render_variant = dict(variant)
+                render_variant["success_rate"] = rate
+                render_variant["success_rate_context"] = context
+                visible.append(render_variant)
                 continue
-            visible.append(variant)
+
+            sequence = context.get("sequence") or setup.get("match") or variant.get("display_lookup_text") or variant.get("lookup_queue_text") or variant.get("queue_text") or ""
+            print(
+                "[SETUP FILTER]"
+                " reason=missing_success_rate"
+                f" round={pc_round or '-'}"
+                f" name={setup.get('id') or '-'}"
+                f" sequence={sequence}"
+                f" checked_sources={','.join(context.get('checked_sources') or [])}"
+                f" available_keys={','.join(sorted(setup.keys()))}"
+            )
         return visible
 
     def format_setup_display_title(self, title, index):
@@ -1524,9 +1560,8 @@ class TetrisScannerApp:
         setup_id = setup.get("id", "-")
         preview_rows = variant.get("preview_rows") or []
         match_text = setup.get("match", "")
-        percent_text = setup.get("percent", "")
         display_sequence = match_text or display_lookup_text[:5]
-        success_rate_text = self.format_setup_success_rate_text(percent_text)
+        success_rate_text = self.format_setup_success_rate_text(variant.get("success_rate"))
 
         self.output.create_rectangle(
             x,
@@ -1590,8 +1625,9 @@ class TetrisScannerApp:
             font=("Consolas", 9),
         )
 
-    def format_setup_success_rate_text(self, percent_text):
-        value = self.parse_setup_success_rate(percent_text)
+    def format_setup_success_rate_text(self, value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            value = self.resolve_setup_success_rate({"percent": value}, None, {})
         if value is None:
             return "성공 확률 계산 불가"
 
@@ -1599,24 +1635,131 @@ class TetrisScannerApp:
             return "성공 확률 100%"
         return f"성공 확률 {value:.2f}%"
 
-    def parse_setup_success_rate(self, percent_text):
-        if percent_text is None:
+    def resolve_setup_success_rate(self, setup, pc_round, context):
+        setup = setup if isinstance(setup, dict) else {}
+        context = context if isinstance(context, dict) else {}
+        context["checked_sources"] = []
+
+        def normalize(raw, source, ratio=False):
+            context["checked_sources"].append(source)
+            if isinstance(raw, bool) or raw is None:
+                return None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value) or value < 0:
+                return None
+            if ratio:
+                if value > 1:
+                    return None
+                value *= 100
+            elif value > 100:
+                return None
+            context["rate_source"] = source
+            context["rate_raw"] = raw
+            return value
+
+        def extract_percent_text(raw, source):
+            context["checked_sources"].append(source)
+            if not isinstance(raw, str):
+                return None
+            import re
+            match = re.search(r"(?<![\d.])(-?(?:\d+(?:\.\d*)?|\.\d+))\s*%", raw)
+            if match:
+                return normalize(match.group(1), source, ratio=False)
+            if re.fullmatch(r"\s*-?(?:\d+(?:\.\d*)?|\.\d+)\s*", raw):
+                return normalize(raw, source, ratio=False)
             return None
 
-        normalized = str(percent_text).strip()
-        if not normalized:
-            return None
-        if normalized.endswith("%"):
-            normalized = normalized[:-1].strip()
+        absolute_fields = ("success_rate", "success_percent", "match_percent", "percentage", "percent")
+        ratio_fields = ("match_rate", "probability")
+        for field in absolute_fields:
+            if field in setup:
+                rate = normalize(setup[field], field, ratio=False)
+                if rate is not None:
+                    return rate
+                rate = extract_percent_text(setup[field], field)
+                if rate is not None:
+                    return rate
+        for field in ratio_fields:
+            if field in setup:
+                rate = normalize(setup[field], field, ratio=True)
+                if rate is not None:
+                    return rate
+                rate = extract_percent_text(setup[field], field)
+                if rate is not None:
+                    return rate
 
-        try:
-            value = float(normalized)
-        except (TypeError, ValueError):
+        # The bundled 2nd--7th round database stores SOL as a 0--1 coverage ratio.
+        if "sol" in setup:
+            raw_sol = setup["sol"]
+            if isinstance(raw_sol, (int, float)) and not isinstance(raw_sol, bool):
+                rate = normalize(raw_sol, "sol.ratio", ratio=True)
+            else:
+                rate = extract_percent_text(raw_sol, "sol.percent")
+            if rate is not None:
+                return rate
+
+        for field in ("match", "specific_sol"):
+            if field in setup:
+                rate = extract_percent_text(setup[field], f"{field}.percent")
+                if rate is not None:
+                    return rate
+        rate = extract_percent_text(context.get("display_lookup_text"), "display_lookup_text.percent")
+        if rate is not None:
+            return rate
+
+        def walk(value, path="setup"):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in absolute_fields:
+                        rate = normalize(child, f"{path}.{key}", ratio=False)
+                        if rate is None:
+                            rate = extract_percent_text(child, f"{path}.{key}")
+                        if rate is not None:
+                            return rate
+                    elif key in ratio_fields or key in ("specific_sol",):
+                        rate = normalize(child, f"{path}.{key}", ratio=True)
+                        if rate is None:
+                            rate = extract_percent_text(child, f"{path}.{key}")
+                        if rate is not None:
+                            return rate
+                    if isinstance(child, (dict, list, tuple)):
+                        rate = walk(child, f"{path}.{key}")
+                        if rate is not None:
+                            return rate
+            elif isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    rate = walk(child, f"{path}[{index}]")
+                    if rate is not None:
+                        return rate
             return None
 
-        if not math.isfinite(value) or not 0 <= value <= 100:
-            return None
-        return value
+        rate = walk(setup)
+        if rate is not None:
+            return rate
+
+        success_count = setup.get("success_count")
+        total_count = setup.get("total_count")
+        if success_count is not None and total_count is not None:
+            try:
+                total = float(total_count)
+                successful = float(success_count)
+            except (TypeError, ValueError):
+                total = 0
+                successful = -1
+            if math.isfinite(total) and math.isfinite(successful) and total > 0 and 0 <= successful <= total:
+                return normalize(successful / total, "success_count/total_count", ratio=True)
+        return None
+
+    def describe_setup_rate_data(self, setup):
+        rate_keys = ("success_rate", "success_percent", "match_percent", "match_rate", "probability", "percentage", "percent", "match", "sol", "specific_sol", "success_count", "total_count")
+        return {
+            key: {"type": type(setup[key]).__name__, "value": repr(setup[key])[:160]}
+            for key in rate_keys
+            if key in setup
+        }
 
     def build_setup_variants(self, result):
         if find_setup_for_pc is None:
@@ -1709,6 +1852,15 @@ class TetrisScannerApp:
 
                 card_title = title if len(found_items) == 1 else f"{title} #{index}"
                 display_lookup_text = (setup.get("match") or found.get("queue") or lookup_queue_text)[:6]
+                success_rate_context = {
+                    "display_lookup_text": display_lookup_text,
+                    "sequence": setup.get("match") or display_lookup_text,
+                }
+                success_rate = self.resolve_setup_success_rate(
+                    setup,
+                    round_from_counter,
+                    success_rate_context,
+                )
                 variants.append(
                     {
                         "title": card_title,
@@ -1716,6 +1868,9 @@ class TetrisScannerApp:
                         "lookup_queue_text": found.get("queue") or lookup_queue_text,
                         "display_lookup_text": display_lookup_text,
                         "setup": setup,
+                        "pc_round": round_from_counter,
+                        "success_rate": success_rate,
+                        "success_rate_context": success_rate_context,
                         "round_text": round_text,
                         "preview_rows": self.assign_setup_piece_colors(
                             self.decode_setup_preview(setup.get("fumen", "")),
